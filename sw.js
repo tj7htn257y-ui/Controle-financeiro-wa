@@ -1,15 +1,15 @@
 'use strict';
 
 /*
- * Service Worker
- * Estratégia: HTML e arquivos locais atualizados pela rede primeiro;
- * se estiver offline, utiliza a cópia em cache.
+ * Meu Controle Financeiro — Service Worker v10
+ * Rede primeiro para os arquivos do aplicativo; cache como alternativa offline.
+ * A biblioteca do Supabase é carregada sob demanda e não faz parte do cache local.
  */
-const CACHE_NAME = 'mcf-offline-v9';
+const CACHE_NAME = 'mcf-offline-v10';
 const APP_FILES = [
   './',
   './index.html',
-  './app.js',
+  './app.js?v=10',
   './manifest.json'
 ];
 
@@ -39,7 +39,8 @@ self.addEventListener('fetch', event => {
   const url = new URL(request.url);
   if (url.origin !== self.location.origin) return;
 
-  const isAppFile = APP_FILES.some(path => new URL(path, self.location.href).pathname === url.pathname);
+  const appPaths = APP_FILES.map(path => new URL(path, self.registration.scope).pathname);
+  const isAppFile = appPaths.includes(url.pathname);
 
   if (request.mode === 'navigate' || isAppFile) {
     event.respondWith(
@@ -47,20 +48,23 @@ self.addEventListener('fetch', event => {
         .then(async response => {
           if (response && response.ok) {
             const cache = await caches.open(CACHE_NAME);
-            const cacheKey = request.mode === 'navigate' ? './index.html' : request;
+            const cacheKey = request.mode === 'navigate'
+              ? new URL('./index.html', self.registration.scope).href
+              : request;
             await cache.put(cacheKey, response.clone());
           }
           return response;
         })
         .catch(async () => {
-          const cached = await caches.match(request) || await caches.match('./index.html');
-          return cached || Response.error();
+          const cached = await caches.match(request, { ignoreSearch: true });
+          if (cached) return cached;
+          const indexUrl = new URL('./index.html', self.registration.scope).href;
+          const fallback = await caches.match(indexUrl);
+          return fallback || Response.error();
         })
     );
     return;
   }
 
-  event.respondWith(
-    caches.match(request).then(cached => cached || fetch(request))
-  );
+  event.respondWith(caches.match(request).then(cached => cached || fetch(request)));
 });
