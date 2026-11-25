@@ -1,9 +1,12 @@
-
 'use strict';
 
-const CACHE_NAME = 'mcf-offline-v8';
-
-const FILES = [
+/*
+ * Service Worker
+ * Estratégia: HTML e arquivos locais atualizados pela rede primeiro;
+ * se estiver offline, utiliza a cópia em cache.
+ */
+const CACHE_NAME = 'mcf-offline-v9';
+const APP_FILES = [
   './',
   './index.html',
   './app.js',
@@ -13,7 +16,7 @@ const FILES = [
 self.addEventListener('install', event => {
   event.waitUntil(
     caches.open(CACHE_NAME)
-      .then(cache => cache.addAll(FILES))
+      .then(cache => cache.addAll(APP_FILES))
       .then(() => self.skipWaiting())
   );
 });
@@ -22,11 +25,7 @@ self.addEventListener('activate', event => {
   event.waitUntil(
     caches.keys()
       .then(keys => Promise.all(
-        keys
-          .filter(name =>
-            name.startsWith('mcf-offline-') &&
-            name !== CACHE_NAME
-          )
+        keys.filter(name => name.startsWith('mcf-offline-') && name !== CACHE_NAME)
           .map(name => caches.delete(name))
       ))
       .then(() => self.clients.claim())
@@ -35,51 +34,33 @@ self.addEventListener('activate', event => {
 
 self.addEventListener('fetch', event => {
   const request = event.request;
-
   if (request.method !== 'GET') return;
 
   const url = new URL(request.url);
-
   if (url.origin !== self.location.origin) return;
 
-  if (request.mode === 'navigate') {
+  const isAppFile = APP_FILES.some(path => new URL(path, self.location.href).pathname === url.pathname);
+
+  if (request.mode === 'navigate' || isAppFile) {
     event.respondWith(
-      fetch(request)
+      fetch(request, { cache: 'no-store' })
         .then(async response => {
           if (response && response.ok) {
             const cache = await caches.open(CACHE_NAME);
-            await cache.put('./index.html', response.clone());
+            const cacheKey = request.mode === 'navigate' ? './index.html' : request;
+            await cache.put(cacheKey, response.clone());
           }
-
           return response;
         })
         .catch(async () => {
-          const cached = await caches.match('./index.html');
-
+          const cached = await caches.match(request) || await caches.match('./index.html');
           return cached || Response.error();
         })
     );
-
     return;
   }
 
   event.respondWith(
-    caches.match(request)
-      .then(async cached => {
-        if (cached) return cached;
-
-        const response = await fetch(request);
-
-        if (
-          response &&
-          response.status === 200 &&
-          response.type === 'basic'
-        ) {
-          const cache = await caches.open(CACHE_NAME);
-          await cache.put(request, response.clone());
-        }
-
-        return response;
-      })
+    caches.match(request).then(cached => cached || fetch(request))
   );
 });
