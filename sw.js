@@ -1,16 +1,19 @@
 'use strict';
 
 /*
- * Meu Controle Financeiro — Service Worker v10
+ * Meu Controle Financeiro — Service Worker v11.1
  * Rede primeiro para os arquivos do aplicativo; cache como alternativa offline.
  * A biblioteca do Supabase é carregada sob demanda e não faz parte do cache local.
  */
-const CACHE_NAME = 'mcf-offline-v10';
+const CACHE_NAME = 'mcf-offline-v11-1';
 const APP_FILES = [
   './',
   './index.html',
-  './app.js?v=10',
-  './manifest.json'
+  './app.js?v=11.1',
+  './manifest.json',
+  './icons/icon-192.png',
+  './icons/icon-512.png',
+  './icons/apple-touch-icon.png'
 ];
 
 self.addEventListener('install', event => {
