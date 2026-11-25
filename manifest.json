@@ -1,11 +1,12 @@
-
 {
   "name": "Meu Controle Financeiro",
   "short_name": "Meu Financeiro",
+  "description": "Planejamento financeiro, contas a pagar e valores a receber.",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",
   "background_color": "#0b1512",
   "theme_color": "#10231d",
-  "lang": "pt-BR"
+  "lang": "pt-BR",
+  "categories": ["finance", "utilities"]
 }
