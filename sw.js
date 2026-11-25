@@ -1,6 +1,6 @@
 'use strict';
 
-const CACHE = 'mcf-offline-v4';
+const CACHE_NAME = 'mcf-offline-v5';
 
 const APP_FILES = [
   './',
@@ -10,26 +10,30 @@ const APP_FILES = [
 ];
 
 self.addEventListener('install', event => {
-  event.waitUntil(
-    caches.open(CACHE)
-      .then(cache => cache.addAll(APP_FILES))
-      .then(() => self.skipWaiting())
-  );
+  event.waitUntil((async () => {
+    const cache = await caches.open(CACHE_NAME);
+
+    await cache.addAll(APP_FILES);
+
+    await self.skipWaiting();
+  })());
 });
 
 self.addEventListener('activate', event => {
-  event.waitUntil(
-    caches.keys()
-      .then(keys => Promise.all(
-        keys
-          .filter(name =>
-            name.startsWith('mcf-offline-') &&
-            name !== CACHE
-          )
-          .map(name => caches.delete(name))
-      ))
-      .then(() => self.clients.claim())
-  );
+  event.waitUntil((async () => {
+    const names = await caches.keys();
+
+    await Promise.all(
+      names
+        .filter(name =>
+          name.startsWith('mcf-offline-') &&
+          name !== CACHE_NAME
+        )
+        .map(name => caches.delete(name))
+    );
+
+    await self.clients.claim();
+  })());
 });
 
 self.addEventListener('fetch', event => {
@@ -42,52 +46,72 @@ self.addEventListener('fetch', event => {
   if (url.origin !== self.location.origin) return;
 
   if (request.mode === 'navigate') {
-    event.respondWith(
-      fetch(request)
-        .then(response => {
-          if (response && response.ok) {
-            const copy = response.clone();
+    event.respondWith((async () => {
+      const cache = await caches.open(CACHE_NAME);
 
-            event.waitUntil(
-              caches.open(CACHE)
-                .then(cache => cache.put('./index.html', copy))
-            );
+      try {
+        const response = await fetch(request);
+
+        if (response && response.ok) {
+          await cache.put(
+            './index.html',
+            response.clone()
+          );
+        }
+
+        return response;
+      } catch (_) {
+        const cached = await cache.match('./index.html');
+
+        if (cached) return cached;
+
+        return new Response(
+          'Aplicativo indisponível offline.',
+          {
+            status:503,
+            headers:{
+              'Content-Type':'text/plain; charset=utf-8'
+            }
           }
-
-          return response;
-        })
-        .catch(() => caches.match('./index.html'))
-    );
+        );
+      }
+    })());
 
     return;
   }
 
-  event.respondWith(
-    caches.match(request)
-      .then(cached => {
-        if (cached) return cached;
+  event.respondWith((async () => {
+    const cache = await caches.open(CACHE_NAME);
 
-        return fetch(request).then(response => {
-          if (response && response.ok) {
-            const copy = response.clone();
+    const cached = await cache.match(request);
 
-            event.waitUntil(
-              caches.open(CACHE)
-                .then(cache => cache.put(request, copy))
-            );
-          }
+    if (cached) return cached;
 
-          return response;
-        });
-      })
-      .catch(() => new Response(
+    try {
+      const response = await fetch(request);
+
+      if (
+        response &&
+        response.ok &&
+        response.type === 'basic'
+      ) {
+        await cache.put(
+          request,
+          response.clone()
+        );
+      }
+
+      return response;
+    } catch (_) {
+      return new Response(
         'Conteúdo indisponível offline.',
         {
-          status: 503,
-          headers: {
-            'Content-Type': 'text/plain; charset=utf-8'
+          status:503,
+          headers:{
+            'Content-Type':'text/plain; charset=utf-8'
           }
         }
-      ))
-  );
+      );
+    }
+  })());
 });
