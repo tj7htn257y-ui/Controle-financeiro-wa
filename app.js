@@ -1,16 +1,15 @@
 'use strict';
 
 /*
- * MEU CONTROLE FINANCEIRO
- * Cofre local criptografado e sincronização Supabase.
+ * Meu Controle Financeiro
+ * A nuvem armazena somente o cofre criptografado (AES-GCM).
+ * A senha usada no login do Supabase também deriva a chave de criptografia.
  */
-
 const SUPABASE_URL = 'https://eornyjvzajqnwghqdhfq.supabase.co';
 const SUPABASE_ANON_KEY = 'sb_publishable_vzdL2qqoEk9850Ha1ygBU_w_cwShRyXY';
 const CLOUD_TABLE = 'cofres_financeiros';
-
-const DB_NAME = 'mcf-db';
-const STORE_NAME = 'vault';
+const DB = 'mcf-db';
+const STORE = 'vault';
 const PBKDF2_ITERATIONS = 250000;
 
 const $ = id => document.getElementById(id);
@@ -18,68 +17,48 @@ const enc = new TextEncoder();
 const dec = new TextDecoder();
 
 let supabase = null;
-let encryptionKey = null;
+let key = null;
 let records = [];
 let currentUser = null;
 let cloudEnabled = false;
 let syncTimer = null;
-let syncInProgress = false;
 
 function today() {
   const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
 }
 
 function month() {
-  return today().slice(0, 7);
+  return today().slice(0,7);
 }
 
-function money(value) {
-  return Number(value || 0).toLocaleString('pt-BR', {
-    style: 'currency',
-    currency: 'BRL'
+function money(n) {
+  return Number(n||0).toLocaleString('pt-BR',{
+    style:'currency',
+    currency:'BRL'
   });
 }
 
-function setStatus(text) {
-  if ($('syncStatus')) $('syncStatus').textContent = text;
-  if ($('syncInfo')) $('syncInfo').textContent = text;
+function setStatus(message) {
+  $('syncStatus').textContent = message;
+  if ($('syncInfo')) $('syncInfo').textContent = message;
 }
 
-function showMessage(text) {
-  if ($('lockMsg')) $('lockMsg').textContent = text;
+function showMessage(message) {
+  $('lockMsg').textContent = message;
 }
-
-function safeError(error) {
-  return error && error.message
-    ? error.message
-    : 'Erro inesperado.';
-}
-
-function makeId() {
-  if (crypto.randomUUID) return crypto.randomUUID();
-
-  return `${Date.now()}-${Array.from(
-    crypto.getRandomValues(new Uint8Array(16))
-  ).map(x => x.toString(16).padStart(2, '0')).join('')}`;
-}
-
-/* SUPABASE */
 
 function initSupabase() {
-  if (!window.supabase ||
-      typeof window.supabase.createClient !== 'function') {
-    return false;
-  }
+  if (!window.supabase || !window.supabase.createClient) return false;
 
   supabase = window.supabase.createClient(
     SUPABASE_URL,
     SUPABASE_ANON_KEY,
     {
       auth: {
-        persistSession: true,
-        autoRefreshToken: true,
-        detectSessionInUrl: true
+        persistSession:true,
+        autoRefreshToken:true,
+        detectSessionInUrl:true
       }
     }
   );
@@ -87,27 +66,18 @@ function initSupabase() {
   return true;
 }
 
-/* INDEXEDDB */
-
 function openDB() {
-  return new Promise((resolve, reject) => {
-    const request = indexedDB.open(DB_NAME, 1);
+  return new Promise((resolve,reject) => {
+    const request = indexedDB.open(DB,1);
 
     request.onupgradeneeded = () => {
-      if (!request.result.objectStoreNames.contains(STORE_NAME)) {
-        request.result.createObjectStore(STORE_NAME);
+      if (!request.result.objectStoreNames.contains(STORE)) {
+        request.result.createObjectStore(STORE);
       }
     };
 
     request.onsuccess = () => resolve(request.result);
-
-    request.onerror = () => reject(
-      request.error || new Error('Não foi possível abrir o armazenamento local.')
-    );
-
-    request.onblocked = () => reject(
-      new Error('O armazenamento está ocupado por outra aba.')
-    );
+    request.onerror = () => reject(request.error);
   });
 }
 
@@ -115,60 +85,40 @@ async function dbGet(name) {
   const db = await openDB();
 
   try {
-    return await new Promise((resolve, reject) => {
-      const request = db.transaction(
-        STORE_NAME,
-        'readonly'
-      ).objectStore(STORE_NAME).get(name);
+    return await new Promise((resolve,reject) => {
+      const request = db.transaction(STORE)
+        .objectStore(STORE)
+        .get(name);
 
       request.onsuccess = () => resolve(request.result);
-
-      request.onerror = () => reject(
-        request.error || new Error('Falha ao ler os dados locais.')
-      );
+      request.onerror = () => reject(request.error);
     });
   } finally {
     db.close();
   }
 }
 
-async function dbSet(name, value) {
-  return dbSetMany([[name, value]]);
-}
-
-async function dbSetMany(entries) {
+async function dbSet(name,value) {
   const db = await openDB();
 
   try {
-    await new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE_NAME, 'readwrite');
-      const store = tx.objectStore(STORE_NAME);
+    await new Promise((resolve,reject) => {
+      const request = db.transaction(STORE,'readwrite')
+        .objectStore(STORE)
+        .put(value,name);
 
-      for (const [name, value] of entries) {
-        store.put(value, name);
-      }
-
-      tx.oncomplete = () => resolve();
-
-      tx.onerror = () => reject(
-        tx.error || new Error('Falha ao gravar os dados locais.')
-      );
-
-      tx.onabort = () => reject(
-        tx.error || new Error('Gravação local cancelada.')
-      );
+      request.onsuccess = () => resolve();
+      request.onerror = () => reject(request.error);
     });
   } finally {
     db.close();
   }
 }
 
-/* CRIPTOGRAFIA */
-
-async function deriveKey(password, salt) {
+async function derive(pass,salt) {
   const material = await crypto.subtle.importKey(
     'raw',
-    enc.encode(password),
+    enc.encode(pass),
     'PBKDF2',
     false,
     ['deriveKey']
@@ -176,206 +126,166 @@ async function deriveKey(password, salt) {
 
   return crypto.subtle.deriveKey(
     {
-      name: 'PBKDF2',
+      name:'PBKDF2',
       salt,
-      iterations: PBKDF2_ITERATIONS,
-      hash: 'SHA-256'
+      iterations:PBKDF2_ITERATIONS,
+      hash:'SHA-256'
     },
     material,
     {
-      name: 'AES-GCM',
-      length: 256
+      name:'AES-GCM',
+      length:256
     },
     false,
-    ['encrypt', 'decrypt']
+    ['encrypt','decrypt']
   );
 }
 
-async function encryptData(value, key = encryptionKey) {
-  if (!key) {
-    throw new Error('Aplicativo bloqueado. Entre novamente.');
+async function encrypt(obj,encryptionKey=key) {
+  if (!encryptionKey) {
+    throw new Error('Aplicativo bloqueado.');
   }
 
   const iv = crypto.getRandomValues(new Uint8Array(12));
 
-  const cipher = await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv },
-    key,
-    enc.encode(JSON.stringify(value))
+  const data = await crypto.subtle.encrypt(
+    {name:'AES-GCM',iv},
+    encryptionKey,
+    enc.encode(JSON.stringify(obj))
   );
 
   return {
-    iv: Array.from(iv),
-    data: Array.from(new Uint8Array(cipher))
+    iv:Array.from(iv),
+    data:Array.from(new Uint8Array(data))
   };
 }
 
-async function decryptData(blob, key = encryptionKey) {
+async function decrypt(blob,encryptionKey=key) {
   if (
-    !key ||
+    !encryptionKey ||
     !blob ||
     !Array.isArray(blob.iv) ||
     !Array.isArray(blob.data)
   ) {
-    throw new Error('Dados criptografados inválidos ou incompletos.');
+    throw new Error('Dados criptografados inválidos.');
   }
 
   const plain = await crypto.subtle.decrypt(
     {
-      name: 'AES-GCM',
-      iv: new Uint8Array(blob.iv)
+      name:'AES-GCM',
+      iv:new Uint8Array(blob.iv)
     },
-    key,
+    encryptionKey,
     new Uint8Array(blob.data)
   );
 
   return JSON.parse(dec.decode(plain));
 }
 
-/* LANÇAMENTOS */
-
 function normalizeRecords(list) {
   if (!Array.isArray(list)) {
-    throw new Error('A lista de lançamentos está inválida.');
+    throw new Error('Lista de lançamentos inválida.');
   }
 
   return list.map(item => {
     if (!item || typeof item !== 'object') {
-      throw new Error('Foi encontrado um lançamento inválido.');
+      throw new Error('Lançamento inválido.');
     }
 
     const value = Number(item.value);
-    const date = String(item.date || '');
-    const desc = String(item.desc || '').trim();
 
     if (
-      !desc ||
+      !item.desc ||
       !Number.isFinite(value) ||
       value <= 0 ||
-      !['in', 'out'].includes(item.type) ||
-      !/^\d{4}-\d{2}-\d{2}$/.test(date)
+      !['in','out'].includes(item.type) ||
+      !/^\d{4}-\d{2}-\d{2}$/.test(item.date)
     ) {
-      throw new Error(
-        'Existe um lançamento com descrição, valor, tipo ou data inválida.'
-      );
+      throw new Error('Existe um lançamento com dados inválidos.');
     }
 
     return {
-      id: String(item.id || makeId()),
-      desc,
+      id:String(item.id || crypto.randomUUID()),
+      desc:String(item.desc),
       value,
-      type: item.type,
-      category: String(item.category || 'Outros'),
-      date
+      type:item.type,
+      category:String(item.category||'Outros'),
+      date:item.date
     };
   });
 }
 
-function mergeRecords(localList, cloudList) {
-  const merged = new Map();
+function mergeRecords(localList,cloudList) {
+  const map = new Map();
 
-  for (const item of localList) {
-    merged.set(String(item.id), item);
+  for (const item of [...localList,...cloudList]) {
+    map.set(String(item.id),item);
   }
 
-  for (const item of cloudList) {
-    const id = String(item.id);
-
-    if (!merged.has(id)) {
-      merged.set(id, item);
-    }
-  }
-
-  return normalizeRecords(Array.from(merged.values()));
+  return normalizeRecords([...map.values()]);
 }
 
 async function persistLocal() {
   const goal = Number(localStorage.getItem('goal') || 15);
 
-  const encrypted = await encryptData({
-    records,
-    goal
-  });
-
-  await dbSet('data', encrypted);
+  await dbSet(
+    'data',
+    await encrypt({records,goal})
+  );
 }
 
-async function readLocalWithPassword(password) {
+async function localUnlock(pass) {
   const meta = await dbGet('meta');
 
   if (!meta || !Array.isArray(meta.salt)) {
     throw new Error('Não há cofre local neste aparelho.');
   }
 
-  const localKey = await deriveKey(
-    password,
+  const localKey = await derive(
+    pass,
     new Uint8Array(meta.salt)
   );
 
   const blob = await dbGet('data');
 
   if (!blob) {
-    throw new Error('O cofre local não contém dados salvos.');
+    throw new Error('Dados locais não encontrados.');
   }
 
-  const data = await decryptData(blob, localKey);
+  const data = await decrypt(blob,localKey);
 
-  return {
-    key: localKey,
-    records: normalizeRecords(data.records || []),
-    goal: Number(data.goal ?? 15),
-    salt: meta.salt
-  };
+  key = localKey;
+  records = normalizeRecords(data.records || []);
+
+  localStorage.setItem(
+    'goal',
+    String(data.goal ?? 15)
+  );
 }
 
-async function localUnlock(password) {
-  const local = await readLocalWithPassword(password);
-
-  encryptionKey = local.key;
-  records = local.records;
-
-  localStorage.setItem('goal', String(local.goal));
-}
-
-async function createLocalVault(password) {
+async function createLocalVault(pass) {
   const salt = crypto.getRandomValues(new Uint8Array(16));
-  const newKey = await deriveKey(password, salt);
 
-  const previousKey = encryptionKey;
-  const previousRecords = records;
+  key = await derive(pass,salt);
 
-  encryptionKey = newKey;
+  await dbSet('meta',{
+    salt:Array.from(salt)
+  });
+
   records = [];
 
-  try {
-    const encrypted = await encryptData(
-      { records, goal: 15 },
-      newKey
-    );
+  localStorage.setItem('goal','15');
 
-    await dbSetMany([
-      ['data', encrypted],
-      ['meta', { salt: Array.from(salt) }]
-    ]);
-
-    localStorage.setItem('goal', '15');
-
-  } catch (error) {
-    encryptionKey = previousKey;
-    records = previousRecords;
-    throw error;
-  }
+  await persistLocal();
 }
-
-/* SINCRONIZAÇÃO NA NUVEM */
 
 async function cloudGet() {
   if (!currentUser) return null;
 
-  const { data, error } = await supabase
+  const {data,error} = await supabase
     .from(CLOUD_TABLE)
     .select('payload,updated_at')
-    .eq('user_id', currentUser.id)
+    .eq('user_id',currentUser.id)
     .maybeSingle();
 
   if (error) throw error;
@@ -384,65 +294,67 @@ async function cloudGet() {
 }
 
 async function cloudSave() {
-  if (!cloudEnabled || !currentUser || !encryptionKey) {
-    return;
-  }
+  if (!cloudEnabled || !currentUser || !key) return;
 
-  const meta = await dbGet('meta');
+  const saltMeta = await dbGet('meta');
 
-  if (!meta || !Array.isArray(meta.salt)) {
-    throw new Error('A chave local não foi encontrada.');
+  if (!saltMeta || !Array.isArray(saltMeta.salt)) {
+    throw new Error(
+      'Chave local do cofre não encontrada. Entre novamente para restaurar o acesso.'
+    );
   }
 
   const payload = {
-    version: 1,
-    salt: meta.salt,
-    ...await encryptData({
+    version:1,
+    salt:saltMeta.salt,
+    ...await encrypt({
       records,
-      goal: Number(localStorage.getItem('goal') || 15)
+      goal:Number(localStorage.getItem('goal')||15)
     })
   };
 
-  const { error } = await supabase
+  const {error} = await supabase
     .from(CLOUD_TABLE)
     .upsert(
       {
-        user_id: currentUser.id,
+        user_id:currentUser.id,
         payload,
-        updated_at: new Date().toISOString()
+        updated_at:new Date().toISOString()
       },
-      {
-        onConflict: 'user_id'
-      }
+      {onConflict:'user_id'}
     );
 
   if (error) throw error;
 
   setStatus(
-    'Sincronizado com segurança em ' +
-    new Date().toLocaleString('pt-BR') + '.'
+    'Sincronizado com segurança em '+
+    new Date().toLocaleString('pt-BR')+'.'
   );
 }
 
-async function restoreCloudPayload(payload, password) {
+async function cloudRestore(pass) {
+  const payload = await cloudGet();
+
   if (!payload) return false;
 
   if (
     payload.version !== 1 ||
     !Array.isArray(payload.salt)
   ) {
-    throw new Error('O formato do cofre na nuvem não é reconhecido.');
+    throw new Error(
+      'Formato de cofre na nuvem não reconhecido.'
+    );
   }
 
-  const cloudKey = await deriveKey(
-    password,
+  const cloudKey = await derive(
+    pass,
     new Uint8Array(payload.salt)
   );
 
-  const cloudData = await decryptData(
+  const cloudData = await decrypt(
     {
-      iv: payload.iv,
-      data: payload.data
+      iv:payload.iv,
+      data:payload.data
     },
     cloudKey
   );
@@ -451,81 +363,131 @@ async function restoreCloudPayload(payload, password) {
     cloudData.records || []
   );
 
-  let mergedRecords = cloudRecords;
+  let localRecords = [];
 
   const localMeta = await dbGet('meta');
   const localBlob = await dbGet('data');
 
-  if (localMeta && localBlob) {
-    const local = await readLocalWithPassword(password);
-
-    mergedRecords = mergeRecords(
-      local.records,
-      cloudRecords
+  if (
+    (localMeta && !localBlob) ||
+    (!localMeta && localBlob)
+  ) {
+    throw new Error(
+      'O cofre local está incompleto. Nenhum dado foi substituído. Restaure um backup antes de continuar.'
     );
   }
 
-  const goal = Number(cloudData.goal ?? 15);
+  if (localMeta && localBlob) {
+    try {
+      const localKey = await derive(
+        pass,
+        new Uint8Array(localMeta.salt)
+      );
 
-  if (!Number.isFinite(goal) || goal < 0 || goal > 100) {
-    throw new Error('A meta salva na nuvem é inválida.');
+      const localData = await decrypt(
+        localBlob,
+        localKey
+      );
+
+      localRecords = normalizeRecords(
+        localData.records || []
+      );
+    } catch (_) {
+      throw new Error(
+        'Há um cofre local protegido por outra senha. Por segurança, nenhum dado local foi substituído. Entre com a senha usada nesse aparelho ou faça um backup antes de continuar.'
+      );
+    }
   }
 
-  const encryptedLocal = await encryptData(
-    { records: mergedRecords, goal },
-    cloudKey
+  key = cloudKey;
+
+  records = mergeRecords(
+    localRecords,
+    cloudRecords
   );
 
-  await dbSetMany([
-    ['meta', { salt: payload.salt }],
-    ['data', encryptedLocal]
-  ]);
+  localStorage.setItem(
+    'goal',
+    String(cloudData.goal ?? 15)
+  );
 
-  encryptionKey = cloudKey;
-  records = mergedRecords;
+  await dbSet('meta',{
+    salt:payload.salt
+  });
 
-  localStorage.setItem('goal', String(goal));
+  await persistLocal();
 
   return true;
 }
 
 async function syncNow() {
-  if (!currentUser || !cloudEnabled || !encryptionKey) {
-    setStatus('Entre na sua conta para sincronizar.');
+  if (!currentUser || !cloudEnabled || !key) {
+    setStatus('Entre na conta para sincronizar.');
     return;
   }
 
-  if (syncInProgress) return;
+  setStatus('Verificando dados da nuvem...');
 
-  syncInProgress = true;
-  setStatus('Sincronizando...');
+  const payload = await cloudGet();
 
-  try {
-    const payload = await cloudGet();
-
-    if (payload) {
-      const cloudData = await decryptData(
-        {
-          iv: payload.iv,
-          data: payload.data
-        },
-        encryptionKey
+  if (payload) {
+    if (
+      payload.version !== 1 ||
+      !Array.isArray(payload.salt)
+    ) {
+      throw new Error(
+        'O cofre da nuvem está em um formato não reconhecido. Nenhum dado foi alterado.'
       );
-
-      const cloudRecords = normalizeRecords(
-        cloudData.records || []
-      );
-
-      records = mergeRecords(records, cloudRecords);
-
-      await persistLocal();
     }
 
-    await cloudSave();
+    const localMeta = await dbGet('meta');
 
-  } finally {
-    syncInProgress = false;
+    if (
+      !localMeta ||
+      JSON.stringify(localMeta.salt) !==
+      JSON.stringify(payload.salt)
+    ) {
+      throw new Error(
+        'A chave de criptografia da nuvem é diferente da chave deste aparelho. Entre novamente antes de sincronizar.'
+      );
+    }
+
+    const cloudData = await decrypt(
+      {
+        iv:payload.iv,
+        data:payload.data
+      },
+      key
+    );
+
+    const cloudRecords = normalizeRecords(
+      cloudData.records || []
+    );
+
+    records = mergeRecords(
+      records,
+      cloudRecords
+    );
+
+    if (cloudData.goal !== undefined) {
+      const cloudGoal = Number(cloudData.goal);
+
+      if (
+        Number.isFinite(cloudGoal) &&
+        cloudGoal >= 0 &&
+        cloudGoal <= 100
+      ) {
+        localStorage.setItem(
+          'goal',
+          String(cloudGoal)
+        );
+      }
+    }
+
+    await persistLocal();
   }
+
+  await cloudSave();
 }
 
 function scheduleSync() {
@@ -535,12 +497,13 @@ function scheduleSync() {
 
   syncTimer = setTimeout(() => {
     syncNow().catch(error => {
-      setStatus('Falha na sincronização: ' + safeError(error));
+      setStatus(
+        'Falha na sincronização: '+
+        (error.message||'erro')
+      );
     });
-  }, 900);
+  },900);
 }
-
-/* ACESSO */
 
 async function openApp() {
   $('lock').classList.add('hidden');
@@ -557,23 +520,27 @@ async function openApp() {
 
 async function login() {
   const email = $('email').value.trim();
-  const password = $('pass').value;
+  const pass = $('pass').value;
 
-  if (!email || !password) {
+  if (!email || !pass) {
     throw new Error('Informe e-mail e senha.');
   }
 
-  if (password.length < 8) {
-    throw new Error('A senha precisa ter pelo menos 8 caracteres.');
+  if (pass.length < 8) {
+    throw new Error(
+      'A senha precisa ter pelo menos 8 caracteres.'
+    );
   }
 
   if (!supabase) {
-    throw new Error('A biblioteca do Supabase não carregou. Verifique a conexão.');
+    throw new Error(
+      'Não foi possível carregar a biblioteca do Supabase. Verifique a internet.'
+    );
   }
 
-  const { data, error } = await supabase.auth.signInWithPassword({
+  const {data,error} = await supabase.auth.signInWithPassword({
     email,
-    password
+    password:pass
   });
 
   if (error) throw error;
@@ -582,68 +549,70 @@ async function login() {
   cloudEnabled = true;
 
   try {
-    const payload = await cloudGet();
+    const exists = await cloudRestore(pass);
 
-    const restored = await restoreCloudPayload(
-      payload,
-      password
-    );
+    if (!exists) {
+      const localMeta = await dbGet('meta');
 
-    if (!restored) {
-      const meta = await dbGet('meta');
-
-      if (meta) {
-        await localUnlock(password);
+      if (localMeta) {
+        await localUnlock(pass);
       } else {
-        await createLocalVault(password);
+        await createLocalVault(pass);
       }
 
       await cloudSave();
-
     } else {
       await cloudSave();
     }
 
+    $('pass').value = '';
+
+    setStatus(
+      'Conta conectada e dados sincronizados.'
+    );
+
+    await openApp();
   } catch (error) {
-    await supabase.auth.signOut().catch(() => {});
+    try {
+      await supabase.auth.signOut();
+    } catch (_) {}
 
     currentUser = null;
     cloudEnabled = false;
+    key = null;
 
     throw error;
   }
-
-  $('pass').value = '';
-
-  setStatus('Conta conectada e dados sincronizados.');
-
-  await openApp();
 }
 
 async function signup() {
   const email = $('email').value.trim();
-  const password = $('pass').value;
+  const pass = $('pass').value;
 
-  if (!email || !password) {
+  if (!email || !pass) {
     throw new Error('Informe e-mail e senha.');
   }
 
-  if (password.length < 8) {
-    throw new Error('Use uma senha com pelo menos 8 caracteres.');
+  if (pass.length < 8) {
+    throw new Error(
+      'Use uma senha com pelo menos 8 caracteres.'
+    );
   }
 
   if (!supabase) {
-    throw new Error('A biblioteca do Supabase não carregou. Verifique a conexão.');
+    throw new Error(
+      'Não foi possível carregar a biblioteca do Supabase. Verifique a internet.'
+    );
   }
 
-  const { data, error } = await supabase.auth.signUp({
+  const {data,error} = await supabase.auth.signUp({
     email,
-    password
+    password:pass
   });
 
   if (error) throw error;
 
-  if (!data.session || !data.user) {
+  if (!data.session) {
     showMessage(
       'Cadastro iniciado. Confirme o e-mail recebido e depois entre no aplicativo.'
     );
@@ -654,40 +623,44 @@ async function signup() {
   cloudEnabled = true;
 
   try {
-    const meta = await dbGet('meta');
+    const localMeta = await dbGet('meta');
 
-    if (meta) {
-      await localUnlock(password);
+    if (localMeta) {
+      await localUnlock(pass);
     } else {
-      await createLocalVault(password);
+      await createLocalVault(pass);
     }
 
     await cloudSave();
 
+    $('pass').value = '';
+
+    setStatus(
+      'Conta criada e cofre sincronizado.'
+    );
+
+    await openApp();
   } catch (error) {
-    await supabase.auth.signOut().catch(() => {});
+    try {
+      await supabase.auth.signOut();
+    } catch (_) {}
 
     currentUser = null;
     cloudEnabled = false;
+    key = null;
 
     throw error;
   }
-
-  $('pass').value = '';
-
-  setStatus('Conta criada e cofre sincronizado.');
-
-  await openApp();
 }
 
 async function offlineLogin() {
-  const password = $('pass').value;
+  const pass = $('pass').value;
 
-  if (!password) {
+  if (!pass) {
     throw new Error('Digite sua senha de proteção.');
   }
 
-  await localUnlock(password);
+  await localUnlock(pass);
 
   currentUser = null;
   cloudEnabled = false;
@@ -695,61 +668,65 @@ async function offlineLogin() {
   $('pass').value = '';
 
   setStatus(
-    'Acesso local. Entre na conta com internet para sincronizar.'
+    'Acesso local. A sincronização será retomada quando entrar na conta com internet.'
   );
 
   await openApp();
 }
 
-/* INTERFACE */
-
 function showTab(tab) {
-  ['home', 'add', 'goals', 'settings'].forEach(name => {
-    $(name).classList.toggle('hidden', name !== tab);
+  ['home','add','goals','settings'].forEach(name => {
+    $(name).classList.toggle('hidden',name!==tab);
   });
 
-  if (tab === 'goals') {
-    $('goalPercent').value = Number(
-      localStorage.getItem('goal') || 15
-    );
+  if (tab==='goals') {
+    $('goalPercent').value =
+      Number(localStorage.getItem('goal')||15);
   }
 }
 
 window.showTab = showTab;
 
-function escapeHTML(value) {
-  return String(value ?? '').replace(/[&<>"']/g, char => ({
-    '&': '&amp;',
-    '<': '&lt;',
-    '>': '&gt;',
-    '"': '&quot;',
-    "'": '&#39;'
-  })[char]);
+function esc(value) {
+  return String(value).replace(
+    /[&<>"']/g,
+    char => ({
+      '&':'&amp;',
+      '<':'&lt;',
+      '>':'&gt;',
+      '"':'&quot;',
+      "'":'&#39;'
+    }[char])
+  );
 }
 
 function render() {
-  const selectedMonth = month();
+  const currentMonth = month();
 
-  const monthly = records.filter(item =>
-    item.date.slice(0, 7) === selectedMonth
+  const monthly = records.filter(
+    item => item.date.slice(0,7)===currentMonth
   );
 
   const income = monthly
-    .filter(item => item.type === 'in')
-    .reduce((sum, item) => sum + item.value, 0);
+    .filter(item=>item.type==='in')
+    .reduce((s,x)=>s+x.value,0);
 
   const expense = monthly
-    .filter(item => item.type === 'out')
-    .reduce((sum, item) => sum + item.value, 0);
+    .filter(item=>item.type==='out')
+    .reduce((s,x)=>s+x.value,0);
 
-  const goal = Number(localStorage.getItem('goal') || 15);
-  const target = income * goal / 100;
-  const saved = income - expense;
-
-  $('monthLabel').textContent = new Date().toLocaleDateString(
-    'pt-BR',
-    { month: 'long', year: 'numeric' }
+  const goal = Number(
+    localStorage.getItem('goal')||15
   );
+
+  const target = income*goal/100;
+  const saved = income-expense;
+
+  $('monthLabel').textContent =
+    new Date().toLocaleDateString(
+      'pt-BR',
+      {month:'long',year:'numeric'}
+    );
 
   $('balance').textContent = money(saved);
   $('income').textContent = money(income);
@@ -758,43 +735,44 @@ function render() {
   $('goalText').textContent =
     `Meta: ${goal}% da renda (${money(target)}). Saldo atual: ${money(saved)}.`;
 
-  $('goalProgress').value = target > 0
-    ? Math.max(0, Math.min(100, saved / target * 100))
-    : 0;
+  $('goalProgress').value =
+    target>0
+      ? Math.max(0,Math.min(100,saved/target*100))
+      : 0;
 
   $('goalPercent').value = goal;
 
-  const sorted = [...monthly].sort((a, b) =>
-    b.date.localeCompare(a.date)
+  const sorted = [...monthly].sort(
+    (a,b)=>b.date.localeCompare(a.date)
   );
 
   $('transactions').innerHTML = sorted.length
     ? sorted.map(item => `
       <div class="item">
         <div>
-          <strong>${escapeHTML(item.desc)}</strong>
+          ${esc(item.desc)}
           <small>
             ${item.date.split('-').reverse().join('/')}
-            · ${escapeHTML(item.category)}
+            · ${esc(item.category)}
           </small>
         </div>
-
         <strong class="amount ${item.type}">
-          ${item.type === 'in' ? '+' : '−'} ${money(item.value)}
+          ${item.type==='in'?'+':'−'} ${money(item.value)}
         </strong>
       </div>
     `).join('')
     : '<p class="muted">Nenhum lançamento neste mês.</p>';
 }
 
-/* EVENTOS */
-
 $('loginBtn').onclick = async () => {
   try {
     showMessage('');
     await login();
   } catch (error) {
-    showMessage('Não foi possível entrar: ' + safeError(error));
+    showMessage(
+      'Não foi possível entrar: '+
+      (error.message||'verifique seus dados.')
+    );
   }
 };
 
@@ -803,7 +781,10 @@ $('createBtn').onclick = async () => {
     showMessage('');
     await signup();
   } catch (error) {
-    showMessage('Não foi possível criar a conta: ' + safeError(error));
+    showMessage(
+      'Não foi possível criar a conta: '+
+      (error.message||'erro desconhecido')
+    );
   }
 };
 
@@ -812,17 +793,28 @@ $('offlineBtn').onclick = async () => {
     showMessage('');
     await offlineLogin();
   } catch (error) {
-    showMessage(safeError(error));
+    showMessage(
+      error.message||
+      'Não foi possível abrir os dados locais.'
+    );
   }
 };
+
+$('date').value = today();
 
 $('saveBtn').onclick = async () => {
   const desc = $('desc').value.trim();
   const value = Number($('value').value);
-  const date = $('date').value || today();
+  const date = $('date').value||today();
 
-  if (!desc || !Number.isFinite(value) || value <= 0) {
-    alert('Informe uma descrição e um valor válido.');
+  if (
+    !desc ||
+    !Number.isFinite(value) ||
+    value<=0
+  ) {
+    alert(
+      'Informe uma descrição e um valor válido.'
+    );
     return;
   }
 
@@ -831,19 +823,18 @@ $('saveBtn').onclick = async () => {
     return;
   }
 
-  const item = {
-    id: makeId(),
+  records.push({
+    id:crypto.randomUUID(),
     desc,
     value,
-    type: $('type').value,
-    category: $('category').value,
+    type:$('type').value,
+    category:$('category').value,
     date
-  };
-
-  records.push(item);
+  });
 
   try {
     await persistLocal();
+    scheduleSync();
 
     $('desc').value = '';
     $('value').value = '';
@@ -851,21 +842,9 @@ $('saveBtn').onclick = async () => {
 
     showTab('home');
     render();
-
-    if (cloudEnabled) {
-      scheduleSync();
-    } else {
-      setStatus('Lançamento salvo com segurança neste aparelho.');
-    }
-
   } catch (error) {
-    records = records.filter(record =>
-      record.id !== item.id
-    );
-
     alert(
-      'Não foi possível salvar. Os dados anteriores foram preservados. ' +
-      safeError(error)
+      'Não foi possível salvar o lançamento.'
     );
   }
 };
@@ -875,56 +854,48 @@ $('goalSave').onclick = async () => {
   const value = Number(raw);
 
   if (
-    raw.trim() === '' ||
+    raw.trim()==='' ||
     !Number.isFinite(value) ||
-    value < 0 ||
-    value > 100
+    value<0 ||
+    value>100
   ) {
-    alert('Informe um percentual entre 0 e 100.');
+    alert(
+      'Informe um percentual entre 0 e 100.'
+    );
     return;
   }
 
-  const oldGoal = localStorage.getItem('goal');
-
   try {
-    localStorage.setItem('goal', String(value));
+    localStorage.setItem(
+      'goal',
+      String(value)
+    );
 
     await persistLocal();
-
+    scheduleSync();
     render();
 
-    if (cloudEnabled) scheduleSync();
-
     alert('Meta salva.');
-
   } catch (error) {
-    if (oldGoal === null) {
-      localStorage.removeItem('goal');
-    } else {
-      localStorage.setItem('goal', oldGoal);
-    }
-
-    alert(
-      'Não foi possível salvar a meta. ' +
-      safeError(error)
-    );
+    alert('Não foi possível salvar a meta.');
   }
 };
 
-/* BACKUP */
-
-function download(data, filename, type) {
+function download(data,name,type) {
   const link = document.createElement('a');
 
   const url = URL.createObjectURL(
-    new Blob([data], { type })
+    new Blob([data],{type})
   );
 
   link.href = url;
-  link.download = filename;
+  link.download = name;
   link.click();
 
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  setTimeout(
+    ()=>URL.revokeObjectURL(url),
+    1000
+  );
 }
 
 $('exportBtn').onclick = async () => {
@@ -941,38 +912,31 @@ $('exportBtn').onclick = async () => {
       throw new Error('Cofre local não encontrado.');
     }
 
-    const backupKey = await deriveKey(
+    const backupKey = await derive(
       password,
       new Uint8Array(meta.salt)
     );
 
-    await decryptData(
-      await dbGet('data'),
-      backupKey
-    );
-
-    const encrypted = await encryptData(
+    const encrypted = await encrypt(
       {
         records,
-        goal: Number(localStorage.getItem('goal') || 15)
+        goal:Number(localStorage.getItem('goal')||15)
       },
       backupKey
     );
 
     download(
       JSON.stringify({
-        version: 2,
-        salt: meta.salt,
+        version:2,
+        salt:meta.salt,
         ...encrypted
       }),
       `backup-meu-financeiro-${today()}.json`,
       'application/json'
     );
-
   } catch (error) {
     alert(
-      'Não foi possível exportar. Confira a senha. ' +
-      safeError(error)
+      'Não foi possível exportar. Confira sua senha.'
     );
   }
 };
@@ -982,11 +946,13 @@ $('importBtn').onclick = async () => {
   const password = $('backupPass').value;
 
   if (!file || !password) {
-    alert('Escolha o arquivo e informe a senha do backup.');
+    alert(
+      'Escolha o arquivo e informe a senha do backup.'
+    );
     return;
   }
 
-  if (file.size > 10 * 1024 * 1024) {
+  if (file.size>10*1024*1024) {
     alert('O arquivo de backup é muito grande.');
     return;
   }
@@ -1001,79 +967,84 @@ $('importBtn').onclick = async () => {
     const backup = JSON.parse(await file.text());
 
     if (
-      ![1, 2].includes(backup.version) ||
+      ![1,2].includes(backup.version) ||
       !Array.isArray(backup.salt)
     ) {
-      throw new Error('Formato de backup inválido.');
+      throw new Error('Formato inválido.');
     }
 
-    const backupKey = await deriveKey(
+    const backupKey = await derive(
       password,
       new Uint8Array(backup.salt)
     );
 
-    const data = await decryptData(backup, backupKey);
-
-    const importedRecords = normalizeRecords(
-      data.records || []
-    );
-
-    const goal = Number(data.goal ?? 15);
-
-    if (!Number.isFinite(goal) || goal < 0 || goal > 100) {
-      throw new Error('Meta inválida.');
-    }
-
-    const encryptedLocal = await encryptData(
-      { records: importedRecords, goal },
+    const data = await decrypt(
+      backup,
       backupKey
     );
 
-    await dbSetMany([
-      ['meta', { salt: backup.salt }],
-      ['data', encryptedLocal]
-    ]);
+    const imported = normalizeRecords(
+      data.records||[]
+    );
 
-    encryptionKey = backupKey;
-    records = importedRecords;
+    const goal = Number(data.goal??15);
 
-    localStorage.setItem('goal', String(goal));
+    if (
+      !Number.isFinite(goal) ||
+      goal<0 ||
+      goal>100
+    ) {
+      throw new Error('Meta inválida.');
+    }
+
+    records = imported;
+
+    localStorage.setItem(
+      'goal',
+      String(goal)
+    );
+
+    key = backupKey;
+
+    await dbSet('meta',{
+      salt:backup.salt
+    });
+
+    await persistLocal();
 
     $('backupFile').value = '';
     $('backupPass').value = '';
 
     render();
-
-    if (cloudEnabled) scheduleSync();
+    scheduleSync();
 
     alert('Backup restaurado com sucesso.');
-
   } catch (error) {
     alert(
-      'Não foi possível restaurar. Verifique o arquivo e a senha. ' +
-      safeError(error)
+      'Não foi possível restaurar. Verifique o arquivo e a senha.'
     );
   }
 };
 
-/* SINCRONIZAR E SAIR */
-
 $('syncBtn').onclick = () => {
   syncNow().catch(error => {
-    setStatus('Falha na sincronização: ' + safeError(error));
+    setStatus(
+      'Falha na sincronização: '+
+      (error.message||'erro')
+    );
   });
 };
 
 $('logoutBtn').onclick = async () => {
-  clearTimeout(syncTimer);
-
   try {
     if (supabase && currentUser) {
       await supabase.auth.signOut();
     }
   } catch (_) {}
 
-  encryptionKey = null;
+  clearTimeout(syncTimer);
+
+  key = null;
   records = [];
   currentUser = null;
   cloudEnabled = false;
@@ -1083,37 +1054,34 @@ $('logoutBtn').onclick = async () => {
   $('pass').value = '';
 
   setStatus(
-    'Aplicativo bloqueado. Os dados locais permanecem criptografados.'
+    'Aplicativo bloqueado. Seus dados locais permanecem criptografados.'
   );
 };
 
-window.addEventListener('online', () => {
+window.addEventListener('online',()=>{
   if (cloudEnabled) {
     syncNow().catch(error => {
-      setStatus('Falha ao reconectar: ' + safeError(error));
+      setStatus(
+        'Falha ao reconectar: '+
+        (error.message||'erro')
+      );
     });
   }
 });
 
-/* SERVICE WORKER */
-
 if ('serviceWorker' in navigator) {
-  window.addEventListener('load', () => {
-    navigator.serviceWorker.register('./sw.js', {
-      updateViaCache: 'none'
-    })
-    .then(registration => registration.update().catch(() => {}))
-    .catch(error => console.error('Service Worker:', error));
+  window.addEventListener('load',()=>{
+    navigator.serviceWorker
+      .register('./sw.js',{updateViaCache:'none'})
+      .then(reg=>reg.update().catch(()=>{}))
+      .catch(err=>console.error('Service Worker:',err));
   });
 }
 
-/* INICIALIZAÇÃO */
-
-(function boot() {
+(function boot(){
   if (!initSupabase()) {
     showMessage(
-      'A biblioteca do Supabase não carregou. ' +
-      'Você ainda pode usar o modo offline neste aparelho.'
+      'Biblioteca de sincronização não carregada. Você ainda pode usar o modo offline se houver dados locais.'
     );
   }
 
