@@ -29,6 +29,7 @@ const enc = new TextEncoder();
 const dec = new TextDecoder();
 
 let supabase = null;
+let supabaseLoadPromise = null;
 let key = null;
 let records = [];
 let deletedIds = [];
@@ -80,11 +81,37 @@ function ensureSession(generation, userId) {
   }
 }
 function initSupabase() {
-  if (!window.supabase || !window.supabase.createClient) return false;
+  if (supabase) return true;
+  if (!window.supabase || typeof window.supabase.createClient !== 'function') return false;
   supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
     auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true }
   });
   return true;
+}
+
+// A biblioteca externa só é carregada quando o usuário escolhe acesso pela conta.
+// Isso impede que uma falha/atraso da CDN bloqueie os botões e o modo offline.
+async function ensureSupabase() {
+  if (initSupabase()) return supabase;
+  if (!supabaseLoadPromise) {
+    supabaseLoadPromise = new Promise((resolve, reject) => {
+      const script = document.createElement('script');
+      script.src = 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2';
+      script.async = true;
+      script.onload = () => {
+        try {
+          if (!initSupabase()) throw new Error('A biblioteca do Supabase foi carregada, mas não ficou disponível.');
+          resolve(supabase);
+        } catch (error) { reject(error); }
+      };
+      script.onerror = () => reject(new Error('Não foi possível carregar a biblioteca de sincronização. Verifique sua conexão e tente novamente.'));
+      document.head.appendChild(script);
+    }).catch(error => {
+      supabaseLoadPromise = null;
+      throw error;
+    });
+  }
+  return supabaseLoadPromise;
 }
 
 /* IndexedDB */
@@ -262,6 +289,7 @@ async function createLocalVault(pass, userId = null) {
     syncedRevision = 0;
   } catch (error) { key = oldKey; throw error; }
 }
+
 /* Nuvem */
 async function cloudGet(userId = currentUser?.id) {
   if (!userId || !supabase) return null;
@@ -455,7 +483,7 @@ async function login() {
   const email = $('email').value.trim(), pass = $('pass').value;
   if (!email || !pass) throw new Error('Informe e-mail e senha.');
   if (pass.length < 8) throw new Error('A senha precisa ter pelo menos 8 caracteres.');
-  if (!supabase) throw new Error('Biblioteca do Supabase não carregada. Verifique a internet.');
+  await ensureSupabase();
   const { data, error } = await supabase.auth.signInWithPassword({ email, password: pass });
   if (error) throw error;
   await initializeAccount(pass, data.user);
@@ -464,7 +492,7 @@ async function signup() {
   const email = $('email').value.trim(), pass = $('pass').value;
   if (!email || !pass) throw new Error('Informe e-mail e senha.');
   if (pass.length < 8) throw new Error('Use uma senha com pelo menos 8 caracteres.');
-  if (!supabase) throw new Error('Biblioteca do Supabase não carregada. Verifique a internet.');
+  await ensureSupabase();
   const { data, error } = await supabase.auth.signUp({ email, password: pass });
   if (error) throw error;
   if (!data.session || !data.user) {
@@ -486,6 +514,7 @@ async function offlineLogin() {
   setStatus('Acesso local. Seus dados permanecem neste aparelho. Entre na conta com internet para sincronizar.');
   await openApp();
 }
+
 /* Interface e navegação */
 function showTab(tab) {
   ['home', 'planning', 'expenses', 'add', 'settings'].forEach(name => {
@@ -822,9 +851,32 @@ if ('serviceWorker' in navigator) {
 
 /* Inicialização */
 (function boot() {
-  if (!window.isSecureContext) showMessage('O aplicativo precisa ser aberto em uma conexão segura HTTPS.');
-  if (!initSupabase()) showMessage('Biblioteca de sincronização não carregada. Você ainda pode usar o modo offline se houver dados locais.');
-  $('date').value = today();
-  $('expenseMonth').value = month();
-  resetEntryForm();
+  try {
+    if (!window.isSecureContext) showMessage('O aplicativo precisa ser aberto em uma conexão segura HTTPS.');
+    // Não carregar a CDN durante a inicialização: o modo offline deve funcionar sozinho.
+    $('date').value = today();
+    $('expenseMonth').value = month();
+    resetEntryForm();
+    if (!window.supabase) {
+      console.info('Supabase será carregado somente quando o usuário solicitar acesso pela conta.');
+    }
+  } catch (error) {
+    console.error('Falha na inicialização do aplicativo:', error);
+    showMessage('O aplicativo encontrou um erro ao iniciar: ' + (error.message || 'erro desconhecido.'));
+  }
 })();
+
+// Mostra erros inesperados na própria tela, em vez de deixar o usuário sem retorno.
+window.addEventListener('error', event => {
+  console.error('Erro JavaScript:', event.error || event.message);
+  if ($('lock') && !$('lock').classList.contains('hidden')) {
+    showMessage('O aplicativo encontrou um erro. Atualize a página e tente novamente.');
+  }
+});
+window.addEventListener('unhandledrejection', event => {
+  console.error('Falha assíncrona:', event.reason);
+  if ($('lock') && !$('lock').classList.contains('hidden')) {
+    const reason = event.reason && event.reason.message ? event.reason.message : 'Falha inesperada.';
+    showMessage(reason);
+  }
+});
