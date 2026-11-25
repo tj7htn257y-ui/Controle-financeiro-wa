@@ -1,3 +1,4 @@
+
 <!doctype html>
 <html lang="pt-BR">
 <head>
@@ -9,6 +10,7 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="apple-mobile-web-app-title" content="Meu Financeiro">
   <link rel="manifest" href="./manifest.json">
+  <link rel="apple-touch-icon" href="./icons/apple-touch-icon.png">
   <title>Meu Controle Financeiro</title>
   <style>
     :root{--bg:#0b1512;--panel:#14231d;--panel2:#1b3027;--text:#f2f7f3;--muted:#a8b9af;--green:#69d39a;--red:#ff8585;--line:#2b4438;--yellow:#f5ca75}
@@ -66,7 +68,7 @@
   <section id="lock" class="card">
     <div class="center">
       <h1>Meu Controle Financeiro</h1>
-      <p class="muted">Seus dados ficam protegidos por criptografia neste aparelho e podem ser sincronizados com sua conta.</p>
+      <p class="muted">Crie seu acesso local ou entre na sua conta. Seus dados ficam criptografados neste aparelho.</p>
     </div>
     <label for="email">E-mail da conta</label>
     <input id="email" type="email" autocomplete="username" placeholder="seuemail@exemplo.com">
@@ -74,7 +76,7 @@
     <input id="pass" type="password" autocomplete="current-password" placeholder="Mínimo de 8 caracteres">
     <button id="loginBtn" style="margin-top:14px">Entrar na minha conta</button>
     <button id="createBtn" class="secondary" style="margin-top:9px">Criar conta</button>
-    <button id="offlineBtn" class="secondary" style="margin-top:9px">Entrar somente neste aparelho</button>
+    <button id="offlineBtn" class="secondary" style="margin-top:9px">Criar ou entrar somente neste aparelho</button>
     <p id="lockMsg" class="muted" role="status" aria-live="polite"></p>
   </section>
 
@@ -195,6 +197,6 @@
     <footer>Meu Controle Financeiro · Uso pessoal · Dados locais criptografados</footer>
   </main>
 
-  <script src="./app.js?v=10"></script>
+  <script src="./app.js?v=11.1"></script>
 </body>
 </html>
