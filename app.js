@@ -40,6 +40,7 @@ let syncInProgress = false;
 let syncRequested = false;
 let localRevision = 0;
 let syncedRevision = 0;
+let localWriteQueue = Promise.resolve();
 let goal = 15;
 let goalUpdatedAt = 0;
 let plan = { income: 0, percentages: {}, updatedAt: 0 };
@@ -199,7 +200,7 @@ function normalizeRecords(list) {
     const status = item.status || (type === 'in' ? 'received' : 'paid');
     if (!['pending', 'paid', 'received'].includes(status)) throw new Error('Situação de lançamento inválida.');
     return {
-      id, desc, value, type,
+      id, desc, value: Math.round((value + Number.EPSILON) * 100) / 100, type,
       category: String(item.category || 'Outros').slice(0, 100),
       date, status,
       updatedAt: Number(item.updatedAt || 0)
@@ -241,16 +242,31 @@ function makeVaultData() {
     plan: normalizePlan(plan)
   };
 }
-async function persistLocal() {
-  if (!key) throw new Error('Cofre bloqueado. Não foi possível salvar.');
-  const encrypted = await encrypt(makeVaultData());
-  await dbSetMany({ data: encrypted });
-  localRevision++;
+function queueLocalWrite(operation) {
+  const task = localWriteQueue.then(operation);
+  // Mantém a fila utilizável mesmo se uma gravação falhar.
+  localWriteQueue = task.catch(() => {});
+  return task;
 }
-async function persistLocalWithMeta(meta, data) {
-  const encrypted = await encrypt(data);
-  await dbSetMany({ meta, data: encrypted });
-  localRevision++;
+async function persistLocal(dataSnapshot = makeVaultData()) {
+  if (!key) throw new Error('Cofre bloqueado. Não foi possível salvar.');
+  // Captura os dados antes da espera e serializa as gravações para impedir
+  // que uma criptografia mais lenta sobrescreva uma alteração mais recente.
+  return queueLocalWrite(async () => {
+    const encrypted = await encrypt(dataSnapshot);
+    await dbSetMany({ data: encrypted });
+    localRevision++;
+    return localRevision;
+  });
+}
+async function persistLocalWithMeta(meta, dataSnapshot) {
+  if (!key) throw new Error('Cofre bloqueado. Não foi possível salvar.');
+  return queueLocalWrite(async () => {
+    const encrypted = await encrypt(dataSnapshot);
+    await dbSetMany({ meta, data: encrypted });
+    localRevision++;
+    return localRevision;
+  });
 }
 function applyVaultData(data) {
   records = normalizeRecords(data.records || []);
@@ -326,7 +342,7 @@ async function cloudRestore(pass, generation, userId) {
     if (!localMeta || !localBlob || !Array.isArray(localMeta.salt)) {
       throw new Error('O cofre local está incompleto. Os dados foram preservados.');
     }
-    if (localMeta.userId !== userId) throw new Error('O cofre local pertence a outra conta. Não vou misturar os dados.');
+    if (localMeta.userId && localMeta.userId !== userId) throw new Error('O cofre local pertence a outra conta. Não vou misturar os dados.');
     try {
       const localKey = await derive(pass, new Uint8Array(localMeta.salt));
       localData = await decrypt(localBlob, localKey);
@@ -364,7 +380,9 @@ async function cloudSave() {
   for (let attempt = 0; attempt < SYNC_RETRIES; attempt++) {
     ensureSession(generation, userId);
     const meta = await dbGet('meta');
-    if (!meta || !Array.isArray(meta.salt) || meta.userId !== userId) throw new Error('Cofre local não pertence à conta conectada.');
+    if (!meta || !Array.isArray(meta.salt) || meta.userId !== userId) {
+      throw new Error('Cofre local não está vinculado à conta conectada.');
+    }
     const cloudRow = await cloudGet(userId);
     ensureSession(generation, userId);
 
@@ -375,6 +393,7 @@ async function cloudSave() {
       cloudData = await decodeCloudPayload(cloudRow.payload, key);
     }
 
+    // Faz o merge e congela um retrato imutável desta tentativa de sincronização.
     const tombstones = normalizeDeletedIds([...deletedIds, ...cloudData.deletedIds]);
     const merged = mergeRecords(records, cloudData.records, tombstones);
     const mergedGoalIsCloudNewer = cloudData.goalUpdatedAt > goalUpdatedAt;
@@ -383,9 +402,12 @@ async function cloudSave() {
     deletedIds = tombstones;
     if (mergedGoalIsCloudNewer) { goal = cloudData.goal; goalUpdatedAt = cloudData.goalUpdatedAt; }
     plan = normalizePlan(mergedPlan);
+    const snapshot = makeVaultData();
 
-    await persistLocal();
-    const encrypted = await encrypt(makeVaultData());
+    // A gravação local entra numa fila serializada. A revisão retornada identifica
+    // exatamente o retrato salvo, sem marcar alterações posteriores como sincronizadas.
+    const snapshotRevision = await persistLocal(snapshot);
+    const encrypted = await encrypt(snapshot);
     const payload = { version: 1, salt: meta.salt, ...encrypted };
     ensureSession(generation, userId);
     const updatedAt = new Date().toISOString();
@@ -393,7 +415,7 @@ async function cloudSave() {
     if (!cloudRow) {
       const { error } = await supabase.from(CLOUD_TABLE).insert({ user_id: userId, payload, updated_at: updatedAt });
       if (!error) {
-        syncedRevision = localRevision;
+        syncedRevision = Math.max(syncedRevision, snapshotRevision);
         setStatus('Sincronizado com segurança em ' + new Date().toLocaleString('pt-BR') + '.');
         return;
       }
@@ -407,7 +429,7 @@ async function cloudSave() {
       .select('user_id').maybeSingle();
     if (error) throw error;
     if (data) {
-      syncedRevision = localRevision;
+      syncedRevision = Math.max(syncedRevision, snapshotRevision);
       setStatus('Sincronizado com segurança em ' + new Date().toLocaleString('pt-BR') + '.');
       return;
     }
@@ -460,8 +482,11 @@ async function initializeAccount(pass, user) {
       const blob = await dbGet('data');
       if (meta || blob) {
         if (!meta || !blob || !Array.isArray(meta.salt)) throw new Error('O cofre local está incompleto. Os dados foram preservados.');
-        if (meta.userId !== user.id) throw new Error('O cofre local pertence a outra conta ou não está vinculado.');
-        await localUnlock(pass);
+        if (meta.userId && meta.userId !== user.id) throw new Error('O cofre local pertence a outra conta. Os dados foram preservados.');
+        const unlockedMeta = await localUnlock(pass);
+        // Vincula um cofre criado anteriormente no modo local somente depois
+        // de a senha conseguir descriptografá-lo e o usuário entrar nesta conta.
+        if (!unlockedMeta.userId) await dbSetMany({ meta: { ...unlockedMeta, userId: user.id } });
       } else await createLocalVault(pass, user.id);
       ensureSession(generation, user.id);
       await cloudSave();
@@ -504,7 +529,16 @@ async function signup() {
 async function offlineLogin() {
   const pass = $('pass').value;
   if (!pass) throw new Error('Digite sua senha de proteção.');
-  await localUnlock(pass);
+  if (pass.length < 8) throw new Error('Use uma senha com pelo menos 8 caracteres.');
+  const meta = await dbGet('meta');
+  const blob = await dbGet('data');
+  if (!meta && !blob) {
+    // Primeiro uso: cria um cofre local novo. Nenhum dado existente é sobrescrito.
+    await createLocalVault(pass, null);
+  } else {
+    if (!meta || !blob) throw new Error('O cofre local está incompleto. Seus dados foram preservados; não tente recriá-lo.');
+    await localUnlock(pass);
+  }
   sessionGeneration++;
   currentUser = null;
   cloudEnabled = false;
@@ -655,10 +689,11 @@ async function handleRecordAction(event) {
   if (button.dataset.action === 'delete') {
     if (!confirm(`Excluir "${item.desc}"? Esta ação não poderá ser desfeita.`)) return;
     const oldRecords = records;
+    const oldDeletedIds = deletedIds;
     records = records.filter(record => record.id !== id);
     deletedIds = normalizeDeletedIds([...deletedIds, id]);
     try { await persistLocal(); scheduleSync(); render(); }
-    catch (error) { records = oldRecords; deletedIds = deletedIds.filter(value => value !== id); alert('Não foi possível excluir: ' + error.message); }
+    catch (error) { records = oldRecords; deletedIds = oldDeletedIds; alert('Não foi possível excluir: ' + error.message); }
     return;
   }
   if (button.dataset.action === 'toggle') {
@@ -687,12 +722,13 @@ $('offlineBtn').onclick = async () => {
 /* Novo lançamento / edição */
 $('saveBtn').onclick = async () => {
   const desc = $('desc').value.trim();
-  const value = Number($('value').value);
+  const rawValue = Number($('value').value);
+  const value = Math.round((rawValue + Number.EPSILON) * 100) / 100;
   const date = $('date').value || today();
   const type = $('type').value;
   const status = $('recordStatus').value;
   if (!desc || desc.length > 300) return alert('Informe uma descrição válida, com até 300 caracteres.');
-  if (!Number.isFinite(value) || value <= 0) return alert('Informe um valor válido.');
+  if (!Number.isFinite(rawValue) || !Number.isFinite(value) || value <= 0) return alert('Informe um valor válido, com no máximo duas casas decimais.');
   if (!validDate(date)) return alert('Informe uma data válida.');
   if (!['in', 'out'].includes(type)) return alert('Selecione o tipo de lançamento.');
   if (!['pending', 'paid', 'received'].includes(status)) return alert('Selecione uma situação válida.');
@@ -824,6 +860,8 @@ async function logout() {
   sessionGeneration++;
   clearTimeout(syncTimer);
   syncRequested = false;
+  // Aguarda gravações locais já iniciadas antes de descartar a chave da sessão.
+  try { await localWriteQueue; } catch (_) {}
   try { if (supabase) await supabase.auth.signOut({ scope: 'local' }); } catch (_) {}
   key = null; records = []; deletedIds = []; goal = 15; goalUpdatedAt = 0;
   plan = normalizePlan({}); currentUser = null; cloudEnabled = false;
