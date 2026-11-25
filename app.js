@@ -1,10 +1,12 @@
+
 'use strict';
 
 /*
  * Meu Controle Financeiro
- * Mantém o cofre criptografado no aparelho e na nuvem.
- * Estrutura da tabela: cofres_financeiros
- * Colunas: user_id, payload, updated_at
+ * Cofre criptografado localmente e sincronizado com Supabase.
+ *
+ * Tabela: cofres_financeiros
+ * Colunas: user_id (uuid), payload (jsonb), updated_at (timestamptz)
  */
 
 const SUPABASE_URL = 'https://eornyjvzajqnwghqdhfq.supabase.co';
@@ -14,6 +16,8 @@ const CLOUD_TABLE = 'cofres_financeiros';
 const DB = 'mcf-db';
 const STORE = 'vault';
 const PBKDF2_ITERATIONS = 250000;
+const BACKUP_MAX_SIZE = 10 * 1024 * 1024;
+const SYNC_RETRIES = 5;
 
 const $ = id => document.getElementById(id);
 const enc = new TextEncoder();
@@ -29,21 +33,30 @@ let syncInProgress = false;
 let syncRequested = false;
 let localRevision = 0;
 let syncedRevision = 0;
+let goal = 15;
 let goalUpdatedAt = 0;
+let sessionGeneration = 0;
+
+/* UTILITÁRIOS */
 
 function today() {
   const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+
+  return [
+    d.getFullYear(),
+    String(d.getMonth() + 1).padStart(2, '0'),
+    String(d.getDate()).padStart(2, '0')
+  ].join('-');
 }
 
 function month() {
-  return today().slice(0,7);
+  return today().slice(0, 7);
 }
 
-function money(n) {
-  return Number(n || 0).toLocaleString('pt-BR',{
-    style:'currency',
-    currency:'BRL'
+function money(value) {
+  return Number(value || 0).toLocaleString('pt-BR', {
+    style: 'currency',
+    currency: 'BRL'
   });
 }
 
@@ -56,17 +69,68 @@ function showMessage(message) {
   if ($('lockMsg')) $('lockMsg').textContent = message;
 }
 
+function validDate(value) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(value))) {
+    return false;
+  }
+
+  const [year, monthNumber, day] = value.split('-').map(Number);
+  const date = new Date(year, monthNumber - 1, day);
+
+  return (
+    date.getFullYear() === year &&
+    date.getMonth() === monthNumber - 1 &&
+    date.getDate() === day
+  );
+}
+
+function validGoal(value) {
+  return Number.isFinite(value) && value >= 0 && value <= 100;
+}
+
+function randomId() {
+  if (crypto.randomUUID) return crypto.randomUUID();
+
+  return (
+    Date.now().toString(36) +
+    '-' +
+    crypto.getRandomValues(new Uint32Array(2)).join('-')
+  );
+}
+
+function sameSalt(a, b) {
+  return (
+    Array.isArray(a) &&
+    Array.isArray(b) &&
+    a.length === b.length &&
+    a.every((value, index) => value === b[index])
+  );
+}
+
+function ensureSession(generation, userId) {
+  if (
+    generation !== sessionGeneration ||
+    !currentUser ||
+    currentUser.id !== userId ||
+    !cloudEnabled
+  ) {
+    throw new Error('A sessão mudou. Operação interrompida por segurança.');
+  }
+}
+
 function initSupabase() {
-  if (!window.supabase || !window.supabase.createClient) return false;
+  if (!window.supabase || !window.supabase.createClient) {
+    return false;
+  }
 
   supabase = window.supabase.createClient(
     SUPABASE_URL,
     SUPABASE_ANON_KEY,
     {
       auth: {
-        persistSession:true,
-        autoRefreshToken:true,
-        detectSessionInUrl:true
+        persistSession: true,
+        autoRefreshToken: true,
+        detectSessionInUrl: true
       }
     }
   );
@@ -77,8 +141,8 @@ function initSupabase() {
 /* BANCO LOCAL */
 
 function openDB() {
-  return new Promise((resolve,reject) => {
-    const request = indexedDB.open(DB,1);
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(DB, 1);
 
     request.onupgradeneeded = () => {
       if (!request.result.objectStoreNames.contains(STORE)) {
@@ -95,7 +159,7 @@ async function dbGet(name) {
   const db = await openDB();
 
   try {
-    return await new Promise((resolve,reject) => {
+    return await new Promise((resolve, reject) => {
       const request = db.transaction(STORE)
         .objectStore(STORE)
         .get(name);
@@ -108,17 +172,43 @@ async function dbGet(name) {
   }
 }
 
-async function dbSet(name,value) {
+async function dbSet(name, value) {
   const db = await openDB();
 
   try {
-    await new Promise((resolve,reject) => {
-      const request = db.transaction(STORE,'readwrite')
-        .objectStore(STORE)
-        .put(value,name);
+    await new Promise((resolve, reject) => {
+      const transaction = db.transaction(STORE, 'readwrite');
 
-      request.onsuccess = () => resolve();
-      request.onerror = () => reject(request.error);
+      transaction.objectStore(STORE).put(value, name);
+
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(transaction.error);
+      transaction.onabort = () => reject(
+        transaction.error || new Error('Gravação local cancelada.')
+      );
+    });
+  } finally {
+    db.close();
+  }
+}
+
+async function dbSetMany(values) {
+  const db = await openDB();
+
+  try {
+    await new Promise((resolve, reject) => {
+      const transaction = db.transaction(STORE, 'readwrite');
+      const objectStore = transaction.objectStore(STORE);
+
+      for (const [name, value] of Object.entries(values)) {
+        objectStore.put(value, name);
+      }
+
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(transaction.error);
+      transaction.onabort = () => reject(
+        transaction.error || new Error('Gravação local cancelada.')
+      );
     });
   } finally {
     db.close();
@@ -127,7 +217,7 @@ async function dbSet(name,value) {
 
 /* CRIPTOGRAFIA */
 
-async function derive(pass,salt) {
+async function derive(pass, salt) {
   const material = await crypto.subtle.importKey(
     'raw',
     enc.encode(pass),
@@ -138,36 +228,44 @@ async function derive(pass,salt) {
 
   return crypto.subtle.deriveKey(
     {
-      name:'PBKDF2',
+      name: 'PBKDF2',
       salt,
-      iterations:PBKDF2_ITERATIONS,
-      hash:'SHA-256'
+      iterations: PBKDF2_ITERATIONS,
+      hash: 'SHA-256'
     },
     material,
-    {name:'AES-GCM',length:256},
+    {
+      name: 'AES-GCM',
+      length: 256
+    },
     false,
-    ['encrypt','decrypt']
+    ['encrypt', 'decrypt']
   );
 }
 
-async function encrypt(obj,encryptionKey=key) {
-  if (!encryptionKey) throw new Error('Aplicativo bloqueado.');
+async function encrypt(data, encryptionKey = key) {
+  if (!encryptionKey) {
+    throw new Error('Aplicativo bloqueado.');
+  }
 
   const iv = crypto.getRandomValues(new Uint8Array(12));
 
-  const data = await crypto.subtle.encrypt(
-    {name:'AES-GCM',iv},
+  const encrypted = await crypto.subtle.encrypt(
+    {
+      name: 'AES-GCM',
+      iv
+    },
     encryptionKey,
-    enc.encode(JSON.stringify(obj))
+    enc.encode(JSON.stringify(data))
   );
 
   return {
-    iv:Array.from(iv),
-    data:Array.from(new Uint8Array(data))
+    iv: Array.from(iv),
+    data: Array.from(new Uint8Array(encrypted))
   };
 }
 
-async function decrypt(blob,encryptionKey=key) {
+async function decrypt(blob, encryptionKey = key) {
   if (
     !encryptionKey ||
     !blob ||
@@ -178,12 +276,29 @@ async function decrypt(blob,encryptionKey=key) {
   }
 
   const plain = await crypto.subtle.decrypt(
-    {name:'AES-GCM',iv:new Uint8Array(blob.iv)},
+    {
+      name: 'AES-GCM',
+      iv: new Uint8Array(blob.iv)
+    },
     encryptionKey,
     new Uint8Array(blob.data)
   );
 
   return JSON.parse(dec.decode(plain));
+}
+
+function validateEncryptedPayload(payload) {
+  if (
+    !payload ||
+    payload.version !== 1 ||
+    !Array.isArray(payload.salt) ||
+    payload.salt.length !== 16 ||
+    !Array.isArray(payload.iv) ||
+    payload.iv.length !== 12 ||
+    !Array.isArray(payload.data)
+  ) {
+    throw new Error('Formato do cofre criptografado inválido.');
+  }
 }
 
 /* VALIDAÇÃO DOS LANÇAMENTOS */
@@ -193,54 +308,67 @@ function normalizeRecords(list) {
     throw new Error('Lista de lançamentos inválida.');
   }
 
+  if (list.length > 100000) {
+    throw new Error('Quantidade de lançamentos acima do limite.');
+  }
+
   const ids = new Set();
 
   return list.map(item => {
-    if (!item || typeof item !== 'object') {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
       throw new Error('Lançamento inválido.');
     }
 
     const value = Number(item.value);
     const date = String(item.date || '');
+    const desc = String(item.desc || '').trim();
+    const type = item.type;
 
     if (
-      !item.desc ||
+      !desc ||
+      desc.length > 300 ||
       !Number.isFinite(value) ||
       value <= 0 ||
-      !['in','out'].includes(item.type) ||
-      !/^\d{4}-\d{2}-\d{2}$/.test(date)
+      !['in', 'out'].includes(type) ||
+      !validDate(date)
     ) {
       throw new Error('Existe um lançamento com dados inválidos.');
     }
 
-    const id = String(item.id || crypto.randomUUID());
+    const id = String(item.id || randomId());
 
-    if (ids.has(id)) {
-      throw new Error('Existem lançamentos com identificadores repetidos.');
+    if (id.length > 100 || ids.has(id)) {
+      throw new Error('Existem lançamentos com identificadores inválidos ou repetidos.');
     }
 
     ids.add(id);
 
     return {
       id,
-      desc:String(item.desc),
+      desc,
       value,
-      type:item.type,
-      category:String(item.category || 'Outros'),
+      type,
+      category: String(item.category || 'Outros').slice(0, 100),
       date
     };
   });
 }
 
-function mergeRecords(localList,cloudList) {
+/*
+ * Não existe exclusão de lançamentos na interface atual.
+ * Por isso, a combinação preserva registros existentes e evita
+ * que uma sincronização substitua lançamentos de outro aparelho.
+ */
+
+function mergeRecords(localList, cloudList) {
   const map = new Map();
 
   for (const item of localList) {
-    map.set(String(item.id),item);
+    map.set(String(item.id), item);
   }
 
   for (const item of cloudList) {
-    map.set(String(item.id),item);
+    map.set(String(item.id), item);
   }
 
   return normalizeRecords([...map.values()]);
@@ -248,26 +376,43 @@ function mergeRecords(localList,cloudList) {
 
 /* COFRE LOCAL */
 
-async function persistLocal() {
-  const goal = Number(localStorage.getItem('goal') || 15);
+function makeVaultData() {
+  return {
+    records: normalizeRecords(records),
+    goal,
+    goalUpdatedAt
+  };
+}
 
-  await dbSet(
-    'data',
-    await encrypt({
-      records,
-      goal,
-      goalUpdatedAt
-    })
-  );
+async function persistLocal() {
+  if (!key) {
+    throw new Error('Cofre bloqueado. Não foi possível salvar.');
+  }
+
+  const encrypted = await encrypt(makeVaultData());
+
+  await dbSet('data', encrypted);
+
+  localRevision++;
+}
+
+async function persistLocalWithMeta(meta, data) {
+  const encrypted = await encrypt(data);
+
+  await dbSetMany({
+    meta,
+    data: encrypted
+  });
 
   localRevision++;
 }
 
 async function localUnlock(pass) {
   const meta = await dbGet('meta');
+  const blob = await dbGet('data');
 
-  if (!meta || !Array.isArray(meta.salt)) {
-    throw new Error('Não há cofre local neste aparelho.');
+  if (!meta || !Array.isArray(meta.salt) || !blob) {
+    throw new Error('Cofre local incompleto ou inexistente.');
   }
 
   const localKey = await derive(
@@ -275,138 +420,106 @@ async function localUnlock(pass) {
     new Uint8Array(meta.salt)
   );
 
-  const blob = await dbGet('data');
+  const data = await decrypt(blob, localKey);
+  const loadedRecords = normalizeRecords(data.records || []);
+  const loadedGoal = Number(data.goal ?? 15);
 
-  if (!blob) {
-    throw new Error('Dados locais não encontrados.');
+  if (!validGoal(loadedGoal)) {
+    throw new Error('A meta armazenada no cofre é inválida.');
   }
 
-  const data = await decrypt(blob,localKey);
-
   key = localKey;
-  records = normalizeRecords(data.records || []);
-
-  localStorage.setItem(
-    'goal',
-    String(data.goal ?? 15)
-  );
-
+  records = loadedRecords;
+  goal = loadedGoal;
   goalUpdatedAt = Number(data.goalUpdatedAt || 0);
+
   localRevision = 0;
   syncedRevision = 0;
+
+  return meta;
 }
 
-async function createLocalVault(pass,userId=null) {
+async function createLocalVault(pass, userId = null) {
   const salt = crypto.getRandomValues(new Uint8Array(16));
+  const newKey = await derive(pass, salt);
 
-  key = await derive(pass,salt);
-
-  await dbSet('meta',{
-    salt:Array.from(salt),
+  const newMeta = {
+    salt: Array.from(salt),
     userId
-  });
+  };
 
+  const oldKey = key;
+
+  key = newKey;
   records = [];
+  goal = 15;
   goalUpdatedAt = Date.now();
 
-  localStorage.setItem('goal','15');
+  try {
+    const encrypted = await encrypt(makeVaultData(), newKey);
 
-  localRevision = 0;
-  syncedRevision = 0;
+    await dbSetMany({
+      meta: newMeta,
+      data: encrypted
+    });
 
-  await persistLocal();
+    localRevision = 0;
+    syncedRevision = 0;
+  } catch (error) {
+    key = oldKey;
+    throw error;
+  }
 }
 
 /* NUVEM */
 
-async function cloudGet() {
-  if (!currentUser) return null;
+async function cloudGet(userId = currentUser?.id) {
+  if (!userId || !supabase) return null;
 
-  const {data,error} = await supabase
+  const { data, error } = await supabase
     .from(CLOUD_TABLE)
     .select('payload,updated_at')
-    .eq('user_id',currentUser.id)
+    .eq('user_id', userId)
     .maybeSingle();
 
   if (error) throw error;
 
-  return data ? data.payload : null;
+  return data || null;
 }
 
-async function cloudSave() {
-  if (!cloudEnabled || !currentUser || !key) return;
+async function decodeCloudPayload(payload, encryptionKey) {
+  validateEncryptedPayload(payload);
 
-  const meta = await dbGet('meta');
+  const data = await decrypt({
+    iv: payload.iv,
+    data: payload.data
+  }, encryptionKey);
 
-  if (!meta || !Array.isArray(meta.salt)) {
-    throw new Error('Cofre local não encontrado.');
-  }
-
-  const snapshotRevision = localRevision;
-  const snapshotRecords = normalizeRecords(records);
-  const snapshotGoal = Number(localStorage.getItem('goal') || 15);
-  const snapshotGoalUpdatedAt = goalUpdatedAt;
-
-  const encrypted = await encrypt({
-    records:snapshotRecords,
-    goal:snapshotGoal,
-    goalUpdatedAt:snapshotGoalUpdatedAt
-  });
-
-  const payload = {
-    version:1,
-    salt:meta.salt,
-    ...encrypted
+  return {
+    records: normalizeRecords(data.records || []),
+    goal: Number(data.goal ?? 15),
+    goalUpdatedAt: Number(data.goalUpdatedAt || 0)
   };
-
-  const {error} = await supabase
-    .from(CLOUD_TABLE)
-    .upsert({
-      user_id:currentUser.id,
-      payload,
-      updated_at:new Date().toISOString()
-    },{
-      onConflict:'user_id'
-    });
-
-  if (error) throw error;
-
-  syncedRevision = Math.max(
-    syncedRevision,
-    snapshotRevision
-  );
-
-  setStatus(
-    'Sincronizado com segurança em ' +
-    new Date().toLocaleString('pt-BR') + '.'
-  );
 }
 
-async function cloudRestore(pass) {
-  const payload = await cloudGet();
+async function cloudRestore(pass, generation, userId) {
+  const cloudRow = await cloudGet(userId);
 
-  if (!payload) return false;
+  ensureSession(generation, userId);
 
-  if (
-    payload.version !== 1 ||
-    !Array.isArray(payload.salt)
-  ) {
-    throw new Error('Formato de cofre na nuvem não reconhecido.');
-  }
+  if (!cloudRow) return false;
+
+  const payload = cloudRow.payload;
+  validateEncryptedPayload(payload);
 
   const cloudKey = await derive(
     pass,
     new Uint8Array(payload.salt)
   );
 
-  const cloudData = await decrypt({
-    iv:payload.iv,
-    data:payload.data
-  },cloudKey);
+  const cloudData = await decodeCloudPayload(payload, cloudKey);
 
-  const cloudRecords = normalizeRecords(
-    cloudData.records || []
-  );
+  ensureSession(generation, userId);
 
   const localMeta = await dbGet('meta');
   const localBlob = await dbGet('data');
@@ -415,13 +528,16 @@ async function cloudRestore(pass) {
   let localGoal = 15;
   let localGoalUpdatedAt = 0;
 
-  if (localMeta && localBlob) {
-    if (
-      localMeta.userId &&
-      localMeta.userId !== currentUser.id
-    ) {
+  if (localMeta || localBlob) {
+    if (!localMeta || !localBlob || !Array.isArray(localMeta.salt)) {
       throw new Error(
-        'Este aparelho possui um cofre vinculado a outra conta. ' +
+        'O cofre local está incompleto. Os dados foram preservados.'
+      );
+    }
+
+    if (localMeta.userId !== userId) {
+      throw new Error(
+        'O cofre local não está vinculado a esta conta. ' +
         'Não vou misturar os dados.'
       );
     }
@@ -432,19 +548,15 @@ async function cloudRestore(pass) {
         new Uint8Array(localMeta.salt)
       );
 
-      const localData = await decrypt(
-        localBlob,
-        localKey
-      );
+      const localData = await decrypt(localBlob, localKey);
 
-      localRecords = normalizeRecords(
-        localData.records || []
-      );
-
+      localRecords = normalizeRecords(localData.records || []);
       localGoal = Number(localData.goal ?? 15);
-      localGoalUpdatedAt = Number(
-        localData.goalUpdatedAt || 0
-      );
+      localGoalUpdatedAt = Number(localData.goalUpdatedAt || 0);
+
+      if (!validGoal(localGoal)) {
+        throw new Error('Meta local inválida.');
+      }
     } catch (_) {
       throw new Error(
         'A senha não desbloqueia o cofre local. ' +
@@ -453,36 +565,192 @@ async function cloudRestore(pass) {
     }
   }
 
-  key = cloudKey;
-  records = mergeRecords(localRecords,cloudRecords);
+  ensureSession(generation, userId);
 
-  const cloudGoal = Number(cloudData.goal ?? 15);
-  const cloudGoalUpdatedAt = Number(
-    cloudData.goalUpdatedAt || 0
+  const mergedRecords = mergeRecords(
+    localRecords,
+    cloudData.records
   );
 
-  if (localGoalUpdatedAt > cloudGoalUpdatedAt) {
-    localStorage.setItem('goal',String(localGoal));
-    goalUpdatedAt = localGoalUpdatedAt;
-  } else {
-    localStorage.setItem('goal',String(cloudGoal));
-    goalUpdatedAt = cloudGoalUpdatedAt;
-  }
+  const useLocalGoal = localGoalUpdatedAt > cloudData.goalUpdatedAt;
 
-  await dbSet('meta',{
-    salt:payload.salt,
-    userId:currentUser.id
-  });
+  const mergedGoal = useLocalGoal
+    ? localGoal
+    : cloudData.goal;
 
-  localRevision = 0;
-  syncedRevision = 0;
+  const mergedGoalUpdatedAt = useLocalGoal
+    ? localGoalUpdatedAt
+    : cloudData.goalUpdatedAt;
 
-  await persistLocal();
+  const newMeta = {
+    salt: payload.salt,
+    userId
+  };
+
+  const newData = {
+    records: mergedRecords,
+    goal: mergedGoal,
+    goalUpdatedAt: mergedGoalUpdatedAt
+  };
+
+  key = cloudKey;
+  records = mergedRecords;
+  goal = mergedGoal;
+  goalUpdatedAt = mergedGoalUpdatedAt;
+
+  await persistLocalWithMeta(newMeta, newData);
+
+  ensureSession(generation, userId);
 
   return true;
 }
 
-/* SINCRONIZAÇÃO COM FILA */
+/*
+ * Atualização otimista:
+ * - lê a versão atual da nuvem;
+ * - combina os lançamentos;
+ * - atualiza somente se updated_at ainda for o mesmo;
+ * - se outro aparelho gravar antes, tenta novamente.
+ *
+ * A tabela continua usando as três colunas já definidas.
+ */
+
+async function cloudSave() {
+  if (!cloudEnabled || !currentUser || !key) {
+    throw new Error('Entre na conta para sincronizar.');
+  }
+
+  const generation = sessionGeneration;
+  const userId = currentUser.id;
+
+  for (let attempt = 0; attempt < SYNC_RETRIES; attempt++) {
+    ensureSession(generation, userId);
+
+    const meta = await dbGet('meta');
+
+    if (
+      !meta ||
+      !Array.isArray(meta.salt) ||
+      meta.userId !== userId
+    ) {
+      throw new Error('Cofre local não pertence à conta conectada.');
+    }
+
+    const cloudRow = await cloudGet(userId);
+
+    ensureSession(generation, userId);
+
+    let cloudRecords = [];
+    let cloudGoal = 15;
+    let cloudGoalUpdatedAt = 0;
+
+    if (cloudRow) {
+      validateEncryptedPayload(cloudRow.payload);
+
+      if (!sameSalt(meta.salt, cloudRow.payload.salt)) {
+        throw new Error(
+          'A chave de proteção local é diferente da chave da nuvem. ' +
+          'Entre novamente para restaurar o cofre.'
+        );
+      }
+
+      const cloudData = await decodeCloudPayload(
+        cloudRow.payload,
+        key
+      );
+
+      cloudRecords = cloudData.records;
+      cloudGoal = cloudData.goal;
+      cloudGoalUpdatedAt = cloudData.goalUpdatedAt;
+    }
+
+    const merged = mergeRecords(records, cloudRecords);
+
+    let mergedGoal = goal;
+    let mergedGoalUpdatedAt = goalUpdatedAt;
+
+    if (cloudGoalUpdatedAt > goalUpdatedAt) {
+      mergedGoal = cloudGoal;
+      mergedGoalUpdatedAt = cloudGoalUpdatedAt;
+    }
+
+    ensureSession(generation, userId);
+
+    records = merged;
+    goal = mergedGoal;
+    goalUpdatedAt = mergedGoalUpdatedAt;
+
+    await persistLocal();
+
+    const encrypted = await encrypt(makeVaultData());
+
+    const payload = {
+      version: 1,
+      salt: meta.salt,
+      ...encrypted
+    };
+
+    ensureSession(generation, userId);
+
+    const updatedAt = new Date().toISOString();
+
+    if (!cloudRow) {
+      const { error } = await supabase
+        .from(CLOUD_TABLE)
+        .insert({
+          user_id: userId,
+          payload,
+          updated_at: updatedAt
+        });
+
+      if (!error) {
+        syncedRevision = localRevision;
+        setStatus(
+          'Sincronizado com segurança em ' +
+          new Date().toLocaleString('pt-BR') + '.'
+        );
+        return;
+      }
+
+      if (error.code === '23505') {
+        continue;
+      }
+
+      throw error;
+    }
+
+    const { data, error } = await supabase
+      .from(CLOUD_TABLE)
+      .update({
+        payload,
+        updated_at: updatedAt
+      })
+      .eq('user_id', userId)
+      .eq('updated_at', cloudRow.updated_at)
+      .select('user_id')
+      .maybeSingle();
+
+    if (error) throw error;
+
+    if (data) {
+      syncedRevision = localRevision;
+
+      setStatus(
+        'Sincronizado com segurança em ' +
+        new Date().toLocaleString('pt-BR') + '.'
+      );
+
+      return;
+    }
+  }
+
+  throw new Error(
+    'Outro aparelho está atualizando os dados neste momento. ' +
+    'Tente sincronizar novamente.'
+  );
+}
+
+/* FILA DE SINCRONIZAÇÃO */
 
 async function syncNow() {
   if (!currentUser || !cloudEnabled || !key) {
@@ -497,12 +765,16 @@ async function syncNow() {
 
   syncInProgress = true;
 
+  const generation = sessionGeneration;
+
   try {
     do {
       syncRequested = false;
       setStatus('Sincronizando...');
 
       await cloudSave();
+
+      if (generation !== sessionGeneration) return;
 
       if (localRevision > syncedRevision) {
         syncRequested = true;
@@ -513,7 +785,11 @@ async function syncNow() {
     syncInProgress = false;
   }
 
-  if (localRevision > syncedRevision) {
+  if (
+    cloudEnabled &&
+    currentUser &&
+    localRevision > syncedRevision
+  ) {
     scheduleSync();
   }
 }
@@ -527,10 +803,10 @@ function scheduleSync() {
     syncNow().catch(error => {
       setStatus(
         'Falha na sincronização: ' +
-        (error.message || 'erro')
+        (error.message || 'erro desconhecido')
       );
     });
-  },900);
+  }, 1000);
 }
 
 /* ABERTURA DO APLICATIVO */
@@ -548,6 +824,70 @@ async function openApp() {
   render();
 }
 
+async function initializeAccount(pass, user) {
+  currentUser = user;
+  cloudEnabled = true;
+
+  sessionGeneration++;
+  const generation = sessionGeneration;
+
+  try {
+    const exists = await cloudRestore(pass, generation, user.id);
+
+    ensureSession(generation, user.id);
+
+    if (!exists) {
+      const meta = await dbGet('meta');
+      const blob = await dbGet('data');
+
+      if (meta || blob) {
+        if (!meta || !blob || !Array.isArray(meta.salt)) {
+          throw new Error(
+            'O cofre local está incompleto. ' +
+            'Os dados foram preservados.'
+          );
+        }
+
+        if (meta.userId !== user.id) {
+          throw new Error(
+            'O cofre local pertence a outra conta ou não está vinculado. ' +
+            'Não vou enviar esses dados para esta conta.'
+          );
+        }
+
+        await localUnlock(pass);
+      } else {
+        await createLocalVault(pass, user.id);
+      }
+
+      ensureSession(generation, user.id);
+
+      await cloudSave();
+    }
+
+    ensureSession(generation, user.id);
+
+    $('pass').value = '';
+    setStatus('Conta conectada e dados sincronizados.');
+
+    await openApp();
+
+  } catch (error) {
+    sessionGeneration++;
+    currentUser = null;
+    cloudEnabled = false;
+    key = null;
+
+    try {
+      await supabase.auth.signOut({ scope: 'local' });
+    } catch (_) {}
+
+    throw error;
+  }
+}
+
+/* LOGIN E CADASTRO */
+
 async function login() {
   const email = $('email').value.trim();
   const pass = $('pass').value;
@@ -561,60 +901,19 @@ async function login() {
   }
 
   if (!supabase) {
-    throw new Error('Biblioteca do Supabase não carregada. Verifique a internet.');
+    throw new Error(
+      'Biblioteca do Supabase não carregada. Verifique a internet.'
+    );
   }
 
-  const {data,error} = await supabase.auth.signInWithPassword({
+  const { data, error } = await supabase.auth.signInWithPassword({
     email,
-    password:pass
+    password: pass
   });
 
   if (error) throw error;
 
-  currentUser = data.user;
-  cloudEnabled = true;
-
-  try {
-    const exists = await cloudRestore(pass);
-
-    if (!exists) {
-      const meta = await dbGet('meta');
-
-      if (meta && meta.userId && meta.userId !== currentUser.id) {
-        throw new Error(
-          'O cofre local pertence a outra conta. ' +
-          'Não vou enviar esses dados para esta conta.'
-        );
-      }
-
-      if (meta) {
-        await localUnlock(pass);
-        await dbSet('meta',{
-          ...meta,
-          userId:currentUser.id
-        });
-      } else {
-        await createLocalVault(pass,currentUser.id);
-      }
-
-      await cloudSave();
-    }
-
-    $('pass').value = '';
-    setStatus('Conta conectada e dados sincronizados.');
-
-    await openApp();
-
-  } catch (error) {
-    currentUser = null;
-    cloudEnabled = false;
-
-    try {
-      await supabase.auth.signOut();
-    } catch (_) {}
-
-    throw error;
-  }
+  await initializeAccount(pass, data.user);
 }
 
 async function signup() {
@@ -630,17 +929,19 @@ async function signup() {
   }
 
   if (!supabase) {
-    throw new Error('Biblioteca do Supabase não carregada. Verifique a internet.');
+    throw new Error(
+      'Biblioteca do Supabase não carregada. Verifique a internet.'
+    );
   }
 
-  const {data,error} = await supabase.auth.signUp({
+  const { data, error } = await supabase.auth.signUp({
     email,
-    password:pass
+    password: pass
   });
 
   if (error) throw error;
 
-  if (!data.session) {
+  if (!data.session || !data.user) {
     showMessage(
       'Cadastro iniciado. Confirme o e-mail recebido. ' +
       'Depois volte e entre no aplicativo.'
@@ -648,43 +949,7 @@ async function signup() {
     return;
   }
 
-  currentUser = data.user;
-  cloudEnabled = true;
-
-  try {
-    const meta = await dbGet('meta');
-
-    if (meta && meta.userId && meta.userId !== currentUser.id) {
-      throw new Error('O cofre local pertence a outra conta.');
-    }
-
-    if (meta) {
-      await localUnlock(pass);
-      await dbSet('meta',{
-        ...meta,
-        userId:currentUser.id
-      });
-    } else {
-      await createLocalVault(pass,currentUser.id);
-    }
-
-    await cloudSave();
-
-    $('pass').value = '';
-    setStatus('Conta criada e cofre sincronizado.');
-
-    await openApp();
-
-  } catch (error) {
-    currentUser = null;
-    cloudEnabled = false;
-
-    try {
-      await supabase.auth.signOut();
-    } catch (_) {}
-
-    throw error;
-  }
+  await initializeAccount(pass, data.user);
 }
 
 async function offlineLogin() {
@@ -696,6 +961,7 @@ async function offlineLogin() {
 
   await localUnlock(pass);
 
+  sessionGeneration++;
   currentUser = null;
   cloudEnabled = false;
 
@@ -703,7 +969,7 @@ async function offlineLogin() {
 
   if (supabase) {
     try {
-      await supabase.auth.signOut();
+      await supabase.auth.signOut({ scope: 'local' });
     } catch (_) {}
   }
 
@@ -720,26 +986,24 @@ async function offlineLogin() {
 /* INTERFACE */
 
 function showTab(tab) {
-  ['home','add','goals','settings'].forEach(name => {
-    $(name).classList.toggle('hidden',name !== tab);
+  ['home', 'add', 'goals', 'settings'].forEach(name => {
+    $(name).classList.toggle('hidden', name !== tab);
   });
 
   if (tab === 'goals') {
-    $('goalPercent').value = Number(
-      localStorage.getItem('goal') || 15
-    );
+    $('goalPercent').value = goal;
   }
 }
 
 window.showTab = showTab;
 
 function esc(value) {
-  return String(value).replace(/[&<>"']/g,char => ({
-    '&':'&amp;',
-    '<':'&lt;',
-    '>':'&gt;',
-    '"':'&quot;',
-    "'":'&#39;'
+  return String(value).replace(/[&<>"']/g, char => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;'
   }[char]));
 }
 
@@ -747,24 +1011,26 @@ function render() {
   const currentMonth = month();
 
   const monthly = records.filter(item =>
-    item.date.slice(0,7) === currentMonth
+    item.date.slice(0, 7) === currentMonth
   );
 
   const income = monthly
     .filter(item => item.type === 'in')
-    .reduce((sum,item) => sum + item.value,0);
+    .reduce((sum, item) => sum + item.value, 0);
 
   const expense = monthly
     .filter(item => item.type === 'out')
-    .reduce((sum,item) => sum + item.value,0);
+    .reduce((sum, item) => sum + item.value, 0);
 
-  const goal = Number(localStorage.getItem('goal') || 15);
   const target = income * goal / 100;
   const saved = income - expense;
 
   $('monthLabel').textContent = new Date().toLocaleDateString(
     'pt-BR',
-    {month:'long',year:'numeric'}
+    {
+      month: 'long',
+      year: 'numeric'
+    }
   );
 
   $('balance').textContent = money(saved);
@@ -776,12 +1042,12 @@ function render() {
     `Saldo atual: ${money(saved)}.`;
 
   $('goalProgress').value = target > 0
-    ? Math.max(0,Math.min(100,saved / target * 100))
+    ? Math.max(0, Math.min(100, saved / target * 100))
     : 0;
 
   $('goalPercent').value = goal;
 
-  const sorted = [...monthly].sort((a,b) =>
+  const sorted = [...monthly].sort((a, b) =>
     b.date.localeCompare(a.date)
   );
 
@@ -803,7 +1069,7 @@ function render() {
     : '<p class="muted">Nenhum lançamento neste mês.</p>';
 }
 
-/* BOTÕES */
+/* BOTÕES DE ACESSO */
 
 $('loginBtn').onclick = async () => {
   try {
@@ -840,31 +1106,46 @@ $('offlineBtn').onclick = async () => {
   }
 };
 
+/* NOVO LANÇAMENTO */
+
 $('date').value = today();
 
 $('saveBtn').onclick = async () => {
   const desc = $('desc').value.trim();
   const value = Number($('value').value);
   const date = $('date').value || today();
+  const type = $('type').value;
 
-  if (!desc || !Number.isFinite(value) || value <= 0) {
-    alert('Informe uma descrição e um valor válido.');
+  if (!desc || desc.length > 300) {
+    alert('Informe uma descrição válida, com até 300 caracteres.');
     return;
   }
 
-  if (!/^\\d{4}-\\d{2}-\\d{2}$/.test(date)) {
+  if (!Number.isFinite(value) || value <= 0) {
+    alert('Informe um valor válido.');
+    return;
+  }
+
+  if (!validDate(date)) {
     alert('Informe uma data válida.');
     return;
   }
 
-  records.push({
-    id:crypto.randomUUID(),
+  if (!['in', 'out'].includes(type)) {
+    alert('Selecione o tipo de lançamento.');
+    return;
+  }
+
+  const newRecord = {
+    id: randomId(),
     desc,
     value,
-    type:$('type').value,
-    category:$('category').value,
+    type,
+    category: $('category').value || 'Outros',
     date
-  });
+  };
+
+  records.push(newRecord);
 
   try {
     await persistLocal();
@@ -877,53 +1158,66 @@ $('saveBtn').onclick = async () => {
     showTab('home');
     render();
 
-  } catch (_) {
-    alert('Não foi possível salvar o lançamento.');
+  } catch (error) {
+    records = records.filter(item => item.id !== newRecord.id);
+
+    alert(
+      'Não foi possível salvar o lançamento: ' +
+      (error.message || 'erro no armazenamento local.')
+    );
   }
 };
+
+/* META */
 
 $('goalSave').onclick = async () => {
   const raw = $('goalPercent').value;
   const value = Number(raw);
 
-  if (
-    raw.trim() === '' ||
-    !Number.isFinite(value) ||
-    value < 0 ||
-    value > 100
-  ) {
+  if (raw.trim() === '' || !validGoal(value)) {
     alert('Informe um percentual entre 0 e 100.');
     return;
   }
 
-  try {
-    localStorage.setItem('goal',String(value));
-    goalUpdatedAt = Date.now();
+  const oldGoal = goal;
+  const oldUpdatedAt = goalUpdatedAt;
 
+  goal = value;
+  goalUpdatedAt = Date.now();
+
+  try {
     await persistLocal();
     scheduleSync();
     render();
 
     alert('Meta salva.');
 
-  } catch (_) {
-    alert('Não foi possível salvar a meta.');
+  } catch (error) {
+    goal = oldGoal;
+    goalUpdatedAt = oldUpdatedAt;
+
+    $('goalPercent').value = goal;
+
+    alert(
+      'Não foi possível salvar a meta: ' +
+      (error.message || 'erro no armazenamento local.')
+    );
   }
 };
 
 /* BACKUP */
 
-function download(data,name,type) {
+function download(data, name, type) {
   const link = document.createElement('a');
   const url = URL.createObjectURL(
-    new Blob([data],{type})
+    new Blob([data], { type })
   );
 
   link.href = url;
   link.download = name;
   link.click();
 
-  setTimeout(() => URL.revokeObjectURL(url),1000);
+  setTimeout(() => URL.revokeObjectURL(url), 1500);
 }
 
 $('exportBtn').onclick = async () => {
@@ -935,9 +1229,10 @@ $('exportBtn').onclick = async () => {
 
   try {
     const meta = await dbGet('meta');
+    const localBlob = await dbGet('data');
 
-    if (!meta || !Array.isArray(meta.salt)) {
-      throw new Error('Cofre local não encontrado.');
+    if (!meta || !localBlob || !Array.isArray(meta.salt)) {
+      throw new Error('Cofre local incompleto.');
     }
 
     const backupKey = await derive(
@@ -945,28 +1240,27 @@ $('exportBtn').onclick = async () => {
       new Uint8Array(meta.salt)
     );
 
-    /* Confirma a senha antes de exportar. */
-    const localBlob = await dbGet('data');
-    await decrypt(localBlob,backupKey);
+    await decrypt(localBlob, backupKey);
 
-    const encrypted = await encrypt({
-      records,
-      goal:Number(localStorage.getItem('goal') || 15),
-      goalUpdatedAt
-    },backupKey);
+    const encrypted = await encrypt(
+      makeVaultData(),
+      backupKey
+    );
 
     download(
       JSON.stringify({
-        version:2,
-        salt:meta.salt,
+        version: 2,
+        salt: meta.salt,
         ...encrypted
       }),
       `backup-meu-financeiro-${today()}.json`,
       'application/json'
     );
 
-  } catch (_) {
-    alert('Não foi possível exportar. Confira sua senha.');
+  } catch (error) {
+    alert(
+      'Não foi possível exportar. Confira sua senha e tente novamente.'
+    );
   }
 };
 
@@ -979,23 +1273,35 @@ $('importBtn').onclick = async () => {
     return;
   }
 
-  if (file.size > 10 * 1024 * 1024) {
+  if (file.size > BACKUP_MAX_SIZE) {
     alert('O arquivo de backup é muito grande.');
     return;
   }
 
   if (!confirm(
-    'A restauração substituirá os lançamentos atuais. Deseja continuar?'
-  )) return;
+    'A restauração substituirá os lançamentos atuais deste aparelho. Deseja continuar?'
+  )) {
+    return;
+  }
+
+  const oldRecords = records;
+  const oldKey = key;
+  const oldGoal = goal;
+  const oldGoalUpdatedAt = goalUpdatedAt;
+
+  const oldMeta = await dbGet('meta');
+  const oldBlob = await dbGet('data');
 
   try {
     const backup = JSON.parse(await file.text());
 
     if (
-      ![1,2].includes(backup.version) ||
-      !Array.isArray(backup.salt)
+      !backup ||
+      ![1, 2].includes(backup.version) ||
+      !Array.isArray(backup.salt) ||
+      backup.salt.length !== 16
     ) {
-      throw new Error('Formato inválido.');
+      throw new Error('Formato de backup inválido.');
     }
 
     const backupKey = await derive(
@@ -1003,68 +1309,59 @@ $('importBtn').onclick = async () => {
       new Uint8Array(backup.salt)
     );
 
-    const data = await decrypt(backup,backupKey);
+    const importedData = await decrypt(backup, backupKey);
+    const importedRecords = normalizeRecords(importedData.records || []);
+    const importedGoal = Number(importedData.goal ?? 15);
 
-    const imported = normalizeRecords(data.records || []);
-    const goal = Number(data.goal ?? 15);
+    if (!validGoal(importedGoal)) {
+      throw new Error('Meta inválida no backup.');
+    }
 
-    if (!Number.isFinite(goal) || goal < 0 || goal > 100) {
-      throw new Error('Meta inválida.');
+    if (!oldKey) {
+      throw new Error('Desbloqueie o cofre antes de restaurar o backup.');
+    }
+
+    if (!oldMeta || !oldBlob || !Array.isArray(oldMeta.salt)) {
+      throw new Error('Cofre local incompleto.');
     }
 
     /*
-     * Se estiver conectado, só permite substituir a nuvem
-     * quando o backup pertence ao mesmo cofre criptográfico.
+     * O backup pode ter outra senha.
+     * Os dados importados são descriptografados com a senha do backup
+     * e criptografados novamente com a chave atual do cofre.
+     * Assim, a senha da conta não é substituída.
      */
-    if (cloudEnabled && currentUser) {
-      const cloudPayload = await cloudGet();
 
-      if (
-        cloudPayload &&
-        JSON.stringify(cloudPayload.salt) !==
-        JSON.stringify(backup.salt)
-      ) {
-        throw new Error(
-          'Este backup usa outra chave de proteção. ' +
-          'A restauração online foi bloqueada para proteger seus dados.'
-        );
+    const importedGoalUpdatedAt = Number(
+      importedData.goalUpdatedAt || Date.now()
+    );
+
+    const newData = {
+      records: importedRecords,
+      goal: importedGoal,
+      goalUpdatedAt: importedGoalUpdatedAt
+    };
+
+    const newMeta = {
+      ...oldMeta
+    };
+
+    if (cloudEnabled && currentUser) {
+      if (newMeta.userId !== currentUser.id) {
+        throw new Error('O cofre local não pertence à conta conectada.');
       }
     }
 
-    const oldRecords = records;
-    const oldKey = key;
-    const oldGoal = localStorage.getItem('goal');
-    const oldGoalUpdatedAt = goalUpdatedAt;
+    records = importedRecords;
+    goal = importedGoal;
+    goalUpdatedAt = importedGoalUpdatedAt;
 
-    try {
-      records = imported;
-      key = backupKey;
-      localStorage.setItem('goal',String(goal));
-      goalUpdatedAt = Number(data.goalUpdatedAt || Date.now());
+    await persistLocalWithMeta(newMeta, newData);
 
-      await dbSet('meta',{
-        salt:backup.salt,
-        userId:currentUser ? currentUser.id : null
-      });
-
-      await persistLocal();
-
-      if (cloudEnabled && currentUser) {
-        await cloudSave();
-      }
-
-    } catch (error) {
-      records = oldRecords;
-      key = oldKey;
-      goalUpdatedAt = oldGoalUpdatedAt;
-
-      if (oldGoal === null) {
-        localStorage.removeItem('goal');
-      } else {
-        localStorage.setItem('goal',oldGoal);
-      }
-
-      throw error;
+    if (cloudEnabled && currentUser) {
+      await cloudSave();
+    } else {
+      setStatus('Backup restaurado neste aparelho.');
     }
 
     $('backupFile').value = '';
@@ -1075,6 +1372,27 @@ $('importBtn').onclick = async () => {
     alert('Backup restaurado com sucesso.');
 
   } catch (error) {
+    records = oldRecords;
+    key = oldKey;
+    goal = oldGoal;
+    goalUpdatedAt = oldGoalUpdatedAt;
+
+    try {
+      if (oldMeta && oldBlob) {
+        await dbSetMany({
+          meta: oldMeta,
+          data: oldBlob
+        });
+      }
+    } catch (_) {
+      alert(
+        'Atenção: houve falha ao restaurar o backup e também ao recuperar ' +
+        'a cópia local anterior. Não feche o aplicativo.'
+      );
+    }
+
+    render();
+
     alert(
       'Não foi possível restaurar: ' +
       (error.message || 'verifique o arquivo e a senha.')
@@ -1088,29 +1406,33 @@ $('syncBtn').onclick = () => {
   syncNow().catch(error => {
     setStatus(
       'Falha na sincronização: ' +
-      (error.message || 'erro')
+      (error.message || 'erro desconhecido')
     );
   });
 };
 
-/* SAIR */
+/* BLOQUEIO E SAÍDA */
 
 $('logoutBtn').onclick = async () => {
+  sessionGeneration++;
+
   clearTimeout(syncTimer);
+
+  syncRequested = false;
+  syncInProgress = false;
 
   try {
     if (supabase) {
-      await supabase.auth.signOut();
+      await supabase.auth.signOut({ scope: 'local' });
     }
   } catch (_) {}
 
   key = null;
   records = [];
+  goal = 15;
+  goalUpdatedAt = 0;
   currentUser = null;
   cloudEnabled = false;
-
-  syncInProgress = false;
-  syncRequested = false;
 
   $('app').classList.add('hidden');
   $('lock').classList.remove('hidden');
@@ -1123,8 +1445,8 @@ $('logoutBtn').onclick = async () => {
 
 /* RECONEXÃO */
 
-window.addEventListener('online',() => {
-  if (cloudEnabled) {
+window.addEventListener('online', () => {
+  if (cloudEnabled && currentUser) {
     syncNow().catch(error => {
       setStatus('Falha ao reconectar: ' + error.message);
     });
@@ -1134,17 +1456,29 @@ window.addEventListener('online',() => {
 /* SERVICE WORKER */
 
 if ('serviceWorker' in navigator) {
-  window.addEventListener('load',() => {
+  window.addEventListener('load', () => {
     navigator.serviceWorker
-      .register('./sw.js',{updateViaCache:'none'})
-      .then(reg => reg.update().catch(() => {}))
-      .catch(error => console.error('Service Worker:',error));
+      .register('./sw.js', {
+        updateViaCache: 'none'
+      })
+      .then(registration => {
+        registration.update().catch(() => {});
+      })
+      .catch(error => {
+        console.error('Service Worker:', error);
+      });
   });
 }
 
 /* INICIALIZAÇÃO */
 
 (function boot() {
+  if (!window.isSecureContext) {
+    showMessage(
+      'O aplicativo precisa ser aberto em uma conexão segura HTTPS.'
+    );
+  }
+
   if (!initSupabase()) {
     showMessage(
       'Biblioteca de sincronização não carregada. ' +
