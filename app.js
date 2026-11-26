@@ -2,16 +2,23 @@
 'use strict';
 
 /*
- * Meu Controle Financeiro
- * Versão com planejamento por categorias, pesquisa mensal,
- * edição/exclusão, situação de contas e cofre criptografado.
+ * MEU CONTROLE FINANCEIRO
+ * Versão corrigida - Supabase + IndexedDB + AES-GCM
  *
- * Tabela Supabase: cofres_financeiros
+ * Tabela: cofres_financeiros
  * Colunas: user_id (uuid), payload (jsonb), updated_at (timestamptz)
+ *
+ * Correções:
+ * - Migração de cofres locais antigos.
+ * - Proteção contra mistura de contas.
+ * - Controle correto de revisões durante sincronização.
+ * - Recuperação de dados locais.
+ * - Sincronização otimista com controle de concorrência.
+ * - Preservação do funcionamento offline.
  */
 
 const SUPABASE_URL = 'https://eornyjvzajqnwghqdhfq.supabase.co';
-const SUPABASE_ANON_KEY = 'sb_publishable_vzdL2qqoEk9850Ha1ygBU_w_cwShRyXY';
+const SUPABASE_ANON_KEY = 'sb_publishable_vzdL2qqoEk9850Ha1ygBUw_cwShRyXY';
 const CLOUD_TABLE = 'cofres_financeiros';
 
 const DB = 'mcf-db';
@@ -32,24 +39,41 @@ const dec = new TextDecoder();
 let supabase = null;
 let supabaseLoadPromise = null;
 let key = null;
+
 let records = [];
 let deletedIds = [];
 let currentUser = null;
 let cloudEnabled = false;
+
 let syncTimer = null;
 let syncInProgress = false;
 let syncRequested = false;
+
 let localRevision = 0;
 let syncedRevision = 0;
+
 let goal = 15;
 let goalUpdatedAt = 0;
-let plan = { income: 0, percentages: {}, updatedAt: 0 };
+
+let plan = {
+  income: 0,
+  percentages: {},
+  updatedAt: 0
+};
+
 let sessionGeneration = 0;
 let editingRecordId = null;
 
+/* UTILITÁRIOS */
+
 function today() {
   const d = new Date();
-  return [d.getFullYear(), String(d.getMonth() + 1).padStart(2, '0'), String(d.getDate()).padStart(2, '0')].join('-');
+
+  return [
+    d.getFullYear(),
+    String(d.getMonth() + 1).padStart(2, '0'),
+    String(d.getDate()).padStart(2, '0')
+  ].join('-');
 }
 
 function month() {
@@ -74,19 +98,24 @@ function showMessage(message) {
 
 function validDate(value) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(String(value))) return false;
+
   const [y, m, d] = value.split('-').map(Number);
   const date = new Date(y, m - 1, d);
+
   return date.getFullYear() === y &&
     date.getMonth() === m - 1 &&
     date.getDate() === d;
 }
 
 function validGoal(value) {
-  return Number.isFinite(value) && value >= 0 && value <= 100;
+  return Number.isFinite(value) &&
+    value >= 0 &&
+    value <= 100;
 }
 
 function randomId() {
   if (crypto.randomUUID) return crypto.randomUUID();
+
   return Date.now().toString(36) + '-' +
     crypto.getRandomValues(new Uint32Array(2)).join('-');
 }
@@ -105,11 +134,17 @@ function ensureSession(generation, userId) {
     currentUser.id !== userId ||
     !cloudEnabled
   ) {
-    throw new Error('A sessão mudou. Operação interrompida por segurança.');
+    throw new Error(
+      'A sessão mudou. Operação interrompida por segurança.'
+    );
   }
 }
 
-/* Inicialização do Supabase */
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/* SUPABASE */
 
 function initSupabase() {
   if (supabase) return true;
@@ -136,11 +171,6 @@ function initSupabase() {
   return true;
 }
 
-/*
- * Carrega o Supabase somente quando necessário.
- * Tenta primeiro jsDelivr e depois Unpkg.
- */
-
 async function ensureSupabase() {
   if (initSupabase()) return supabase;
 
@@ -166,11 +196,9 @@ async function ensureSupabase() {
                 if (!initSupabase()) {
                   script.remove();
 
-                  reject(
-                    new Error(
-                      'O arquivo foi carregado, mas window.supabase.createClient não ficou disponível.'
-                    )
-                  );
+                  reject(new Error(
+                    'Biblioteca Supabase carregada sem createClient.'
+                  ));
 
                   return;
                 }
@@ -185,9 +213,9 @@ async function ensureSupabase() {
             script.onerror = () => {
               script.remove();
 
-              reject(
-                new Error('Falha ao carregar a biblioteca em ' + src)
-              );
+              reject(new Error(
+                'Falha ao carregar a biblioteca Supabase.'
+              ));
             };
 
             document.head.appendChild(script);
@@ -201,12 +229,8 @@ async function ensureSupabase() {
       }
 
       throw new Error(
-        'Não foi possível inicializar o Supabase pelas duas fontes. ' +
-        (
-          lastError && lastError.message
-            ? lastError.message
-            : 'Verifique a conexão e tente novamente.'
-        )
+        'Não foi possível inicializar o Supabase. ' +
+        (lastError?.message || 'Verifique a internet.')
       );
 
     })().catch(error => {
@@ -218,7 +242,7 @@ async function ensureSupabase() {
   return supabaseLoadPromise;
 }
 
-/* IndexedDB */
+/* INDEXEDDB */
 
 function openDB() {
   return new Promise((resolve, reject) => {
@@ -265,6 +289,7 @@ async function dbSetMany(values) {
 
       tx.oncomplete = resolve;
       tx.onerror = () => reject(tx.error);
+
       tx.onabort = () => reject(
         tx.error || new Error('Gravação local cancelada.')
       );
@@ -274,7 +299,7 @@ async function dbSetMany(values) {
   }
 }
 
-/* Criptografia */
+/* CRIPTOGRAFIA */
 
 async function derive(pass, salt) {
   const material = await crypto.subtle.importKey(
@@ -293,7 +318,10 @@ async function derive(pass, salt) {
       hash: 'SHA-256'
     },
     material,
-    { name: 'AES-GCM', length: 256 },
+    {
+      name: 'AES-GCM',
+      length: 256
+    },
     false,
     ['encrypt', 'decrypt']
   );
@@ -307,7 +335,10 @@ async function encrypt(data, encryptionKey = key) {
   const iv = crypto.getRandomValues(new Uint8Array(12));
 
   const encrypted = await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv },
+    {
+      name: 'AES-GCM',
+      iv
+    },
     encryptionKey,
     enc.encode(JSON.stringify(data))
   );
@@ -350,11 +381,13 @@ function validateEncryptedPayload(payload) {
     payload.iv.length !== 12 ||
     !Array.isArray(payload.data)
   ) {
-    throw new Error('Formato do cofre criptografado inválido.');
+    throw new Error(
+      'Formato do cofre criptografado inválido.'
+    );
   }
 }
 
-/* Normalização e compatibilidade */
+/* NORMALIZAÇÃO */
 
 function normalizeRecords(list) {
   if (!Array.isArray(list) || list.length > 100000) {
@@ -385,13 +418,17 @@ function normalizeRecords(list) {
       !['in', 'out'].includes(type) ||
       !validDate(date)
     ) {
-      throw new Error('Existe um lançamento com dados inválidos.');
+      throw new Error(
+        'Existe um lançamento com dados inválidos.'
+      );
     }
 
     const id = String(item.id || randomId());
 
     if (id.length > 100 || ids.has(id)) {
-      throw new Error('Identificadores de lançamentos inválidos ou repetidos.');
+      throw new Error(
+        'Identificadores inválidos ou repetidos.'
+      );
     }
 
     ids.add(id);
@@ -399,7 +436,11 @@ function normalizeRecords(list) {
     const status = item.status ||
       (type === 'in' ? 'received' : 'paid');
 
-    if (!['pending', 'paid', 'received'].includes(status)) {
+    if (
+      !['pending', 'paid', 'received'].includes(status) ||
+      (type === 'out' && status === 'received') ||
+      (type === 'in' && status === 'paid')
+    ) {
       throw new Error('Situação de lançamento inválida.');
     }
 
@@ -411,26 +452,37 @@ function normalizeRecords(list) {
       category: String(item.category || 'Outros').slice(0, 100),
       date,
       status,
-      updatedAt: Number(item.updatedAt || 0)
+      updatedAt: Math.max(0, Number(item.updatedAt) || 0)
     };
   });
 }
 
 function normalizePlan(value) {
-  const source = value && typeof value === 'object' ? value : {};
+  const source = value && typeof value === 'object'
+    ? value
+    : {};
+
   const percentages = {};
 
   for (const category of CATEGORIES) {
-    const n = Number(source.percentages?.[category] ?? 0);
+    const n = Number(
+      source.percentages?.[category] ?? 0
+    );
 
     percentages[category] =
-      Number.isFinite(n) && n >= 0 && n <= 100 ? n : 0;
+      Number.isFinite(n) && n >= 0 && n <= 100
+        ? n
+        : 0;
   }
 
+  const income = Number(source.income);
+
   return {
-    income: Math.max(0, Number(source.income) || 0),
+    income: Number.isFinite(income) && income > 0
+      ? income
+      : 0,
     percentages,
-    updatedAt: Number(source.updatedAt || 0)
+    updatedAt: Math.max(0, Number(source.updatedAt) || 0)
   };
 }
 
@@ -439,7 +491,9 @@ function normalizeDeletedIds(list) {
 
   return [
     ...new Set(
-      list.map(String).filter(id => id.length > 0 && id.length <= 100)
+      list.map(String).filter(
+        id => id.length > 0 && id.length <= 100
+      )
     )
   ].slice(-100000);
 }
@@ -455,7 +509,8 @@ function mergeRecords(localList, cloudList, tombstones = []) {
 
     if (
       !previous ||
-      Number(item.updatedAt || 0) >= Number(previous.updatedAt || 0)
+      Number(item.updatedAt || 0) >
+        Number(previous.updatedAt || 0)
     ) {
       map.set(String(item.id), item);
     }
@@ -463,6 +518,8 @@ function mergeRecords(localList, cloudList, tombstones = []) {
 
   return normalizeRecords([...map.values()]);
 }
+
+/* COFRE */
 
 function makeVaultData() {
   return {
@@ -476,12 +533,16 @@ function makeVaultData() {
 
 async function persistLocal() {
   if (!key) {
-    throw new Error('Cofre bloqueado. Não foi possível salvar.');
+    throw new Error(
+      'Cofre bloqueado. Não foi possível salvar.'
+    );
   }
 
   const encrypted = await encrypt(makeVaultData());
 
-  await dbSetMany({ data: encrypted });
+  await dbSetMany({
+    data: encrypted
+  });
 
   localRevision++;
 }
@@ -507,7 +568,11 @@ function applyVaultData(data) {
     throw new Error('Meta armazenada inválida.');
   }
 
-  goalUpdatedAt = Number(data.goalUpdatedAt || 0);
+  goalUpdatedAt = Math.max(
+    0,
+    Number(data.goalUpdatedAt) || 0
+  );
+
   plan = normalizePlan(data.plan);
 }
 
@@ -520,7 +585,9 @@ async function localUnlock(pass) {
     !Array.isArray(meta.salt) ||
     !blob
   ) {
-    throw new Error('Cofre local incompleto ou inexistente.');
+    throw new Error(
+      'Cofre local incompleto ou inexistente.'
+    );
   }
 
   const localKey = await derive(
@@ -540,7 +607,9 @@ async function localUnlock(pass) {
 }
 
 async function createLocalVault(pass, userId = null) {
-  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const salt = crypto.getRandomValues(
+    new Uint8Array(16)
+  );
 
   const newKey = await derive(pass, salt);
 
@@ -573,7 +642,7 @@ async function createLocalVault(pass, userId = null) {
   }
 }
 
-/* Nuvem */
+/* SUPABASE - LEITURA */
 
 async function cloudGet(userId = currentUser?.id) {
   if (!userId || !supabase) return null;
@@ -600,14 +669,22 @@ async function decodeCloudPayload(payload, encryptionKey) {
     encryptionKey
   );
 
-  return {
+  const decoded = {
     records: normalizeRecords(data.records || []),
     deletedIds: normalizeDeletedIds(data.deletedIds || []),
     goal: Number(data.goal ?? 15),
     goalUpdatedAt: Number(data.goalUpdatedAt || 0),
     plan: normalizePlan(data.plan)
   };
+
+  if (!validGoal(decoded.goal)) {
+    throw new Error('Meta da nuvem inválida.');
+  }
+
+  return decoded;
 }
+
+/* RESTAURAÇÃO E MIGRAÇÃO */
 
 async function cloudRestore(pass, generation, userId) {
   const cloudRow = await cloudGet(userId);
@@ -648,13 +725,24 @@ async function cloudRestore(pass, generation, userId) {
       !Array.isArray(localMeta.salt)
     ) {
       throw new Error(
-        'O cofre local está incompleto. Os dados foram preservados.'
+        'O cofre local está incompleto. ' +
+        'Os dados foram preservados.'
       );
     }
 
-    if (localMeta.userId !== userId) {
+    /*
+     * CORREÇÃO:
+     * Cofres antigos sem userId podem ser migrados.
+     * Cofres vinculados a outra conta continuam protegidos.
+     */
+
+    if (
+      localMeta.userId &&
+      localMeta.userId !== userId
+    ) {
       throw new Error(
-        'O cofre local pertence a outra conta. Não vou misturar os dados.'
+        'O cofre local pertence a outra conta. ' +
+        'Não vou misturar os dados.'
       );
     }
 
@@ -664,19 +752,32 @@ async function cloudRestore(pass, generation, userId) {
         new Uint8Array(localMeta.salt)
       );
 
-      localData = await decrypt(localBlob, localKey);
+      localData = await decrypt(
+        localBlob,
+        localKey
+      );
 
-      localData.records = normalizeRecords(localData.records || []);
-      localData.deletedIds = normalizeDeletedIds(localData.deletedIds || []);
-      localData.plan = normalizePlan(localData.plan);
+      localData.records = normalizeRecords(
+        localData.records || []
+      );
+
+      localData.deletedIds = normalizeDeletedIds(
+        localData.deletedIds || []
+      );
+
+      localData.plan = normalizePlan(
+        localData.plan
+      );
 
       if (!validGoal(Number(localData.goal ?? 15))) {
         throw new Error('Meta local inválida.');
       }
 
-    } catch (_) {
+    } catch (error) {
       throw new Error(
-        'A senha não desbloqueia o cofre local. Os dados locais foram preservados.'
+        'Não foi possível desbloquear o cofre local. ' +
+        'Os dados foram preservados. ' +
+        'Confira a senha utilizada anteriormente.'
       );
     }
   }
@@ -693,28 +794,40 @@ async function cloudRestore(pass, generation, userId) {
   );
 
   const useLocalGoal =
-    Number(localData.goalUpdatedAt || 0) > cloudData.goalUpdatedAt;
+    Number(localData.goalUpdatedAt || 0) >
+    cloudData.goalUpdatedAt;
 
   const useLocalPlan =
-    Number(localData.plan?.updatedAt || 0) > cloudData.plan.updatedAt;
+    Number(localData.plan?.updatedAt || 0) >
+    cloudData.plan.updatedAt;
 
   const newData = {
     records: mergedRecords,
     deletedIds: tombstones,
+
     goal: useLocalGoal
       ? Number(localData.goal ?? 15)
       : cloudData.goal,
+
     goalUpdatedAt: useLocalGoal
       ? Number(localData.goalUpdatedAt || 0)
       : cloudData.goalUpdatedAt,
+
     plan: useLocalPlan
       ? normalizePlan(localData.plan)
       : cloudData.plan
   };
 
+  ensureSession(generation, userId);
+
   key = cloudKey;
 
   applyVaultData(newData);
+
+  /*
+   * O cofre local passa a utilizar a chave e o salt
+   * da nuvem, mantendo os dados mesclados.
+   */
 
   await persistLocalWithMeta(
     {
@@ -729,15 +842,23 @@ async function cloudRestore(pass, generation, userId) {
   return true;
 }
 
+/* SINCRONIZAÇÃO SEGURA */
+
 async function cloudSave() {
   if (!cloudEnabled || !currentUser || !key) {
-    throw new Error('Entre na conta para sincronizar.');
+    throw new Error(
+      'Entre na conta para sincronizar.'
+    );
   }
 
   const generation = sessionGeneration;
   const userId = currentUser.id;
 
-  for (let attempt = 0; attempt < SYNC_RETRIES; attempt++) {
+  for (
+    let attempt = 0;
+    attempt < SYNC_RETRIES;
+    attempt++
+  ) {
     ensureSession(generation, userId);
 
     const meta = await dbGet('meta');
@@ -747,7 +868,9 @@ async function cloudSave() {
       !Array.isArray(meta.salt) ||
       meta.userId !== userId
     ) {
-      throw new Error('Cofre local não pertence à conta conectada.');
+      throw new Error(
+        'Cofre local não pertence à conta conectada.'
+      );
     }
 
     const cloudRow = await cloudGet(userId);
@@ -767,7 +890,8 @@ async function cloudSave() {
 
       if (!sameSalt(meta.salt, cloudRow.payload.salt)) {
         throw new Error(
-          'A chave local é diferente da chave da nuvem. Restaure o cofre correto.'
+          'A chave local é diferente da chave da nuvem. ' +
+          'Restaure o cofre correto.'
         );
       }
 
@@ -806,9 +930,24 @@ async function cloudSave() {
 
     plan = normalizePlan(mergedPlan);
 
+    /*
+     * Persistimos a mesclagem local antes do envio.
+     */
+
     await persistLocal();
 
-    const encrypted = await encrypt(makeVaultData());
+    ensureSession(generation, userId);
+
+    /*
+     * CORREÇÃO DA CONCORRÊNCIA:
+     * Criamos um retrato independente dos dados e
+     * guardamos a revisão exata que será enviada.
+     */
+
+    const snapshot = makeVaultData();
+    const revisionToSync = localRevision;
+
+    const encrypted = await encrypt(snapshot);
 
     const payload = {
       version: 1,
@@ -829,8 +968,13 @@ async function cloudSave() {
           updated_at: updatedAt
         });
 
+      ensureSession(generation, userId);
+
       if (!error) {
-        syncedRevision = localRevision;
+        syncedRevision = Math.max(
+          syncedRevision,
+          revisionToSync
+        );
 
         setStatus(
           'Sincronizado com segurança em ' +
@@ -840,7 +984,10 @@ async function cloudSave() {
         return;
       }
 
-      if (error.code === '23505') continue;
+      if (error.code === '23505') {
+        await delay(150);
+        continue;
+      }
 
       throw error;
     }
@@ -856,10 +1003,20 @@ async function cloudSave() {
       .select('user_id')
       .maybeSingle();
 
+    ensureSession(generation, userId);
+
     if (error) throw error;
 
     if (data) {
-      syncedRevision = localRevision;
+      /*
+       * Só marca como sincronizada a revisão
+       * que efetivamente foi enviada.
+       */
+
+      syncedRevision = Math.max(
+        syncedRevision,
+        revisionToSync
+      );
 
       setStatus(
         'Sincronizado com segurança em ' +
@@ -868,14 +1025,17 @@ async function cloudSave() {
 
       return;
     }
+
+    await delay(150 * (attempt + 1));
   }
 
   throw new Error(
-    'Outro aparelho está atualizando os dados. Tente sincronizar novamente.'
+    'Outro aparelho está atualizando os dados. ' +
+    'Tente sincronizar novamente.'
   );
 }
 
-/* Fila de sincronização */
+/* FILA DE SINCRONIZAÇÃO */
 
 async function syncNow() {
   if (!currentUser || !cloudEnabled || !key) {
@@ -902,22 +1062,30 @@ async function syncNow() {
 
       if (generation !== sessionGeneration) return;
 
+      /*
+       * Se houve alteração durante o envio,
+       * solicita outra sincronização.
+       */
+
       if (localRevision > syncedRevision) {
         syncRequested = true;
       }
 
     } while (syncRequested);
 
+  } catch (error) {
+    throw error;
+
   } finally {
     syncInProgress = false;
-  }
 
-  if (
-    cloudEnabled &&
-    currentUser &&
-    localRevision > syncedRevision
-  ) {
-    scheduleSync();
+    if (
+      cloudEnabled &&
+      currentUser &&
+      localRevision > syncedRevision
+    ) {
+      scheduleSync();
+    }
   }
 }
 
@@ -936,7 +1104,7 @@ function scheduleSync() {
   }, 1200);
 }
 
-/* Conta e abertura */
+/* ABERTURA DO APLICATIVO */
 
 async function openApp() {
   $('lock').classList.add('hidden');
@@ -951,6 +1119,8 @@ async function openApp() {
 
   render();
 }
+
+/* CONTA E MIGRAÇÃO */
 
 async function initializeAccount(pass, user) {
   currentUser = user;
@@ -979,17 +1149,44 @@ async function initializeAccount(pass, user) {
           !Array.isArray(meta.salt)
         ) {
           throw new Error(
-            'O cofre local está incompleto. Os dados foram preservados.'
+            'O cofre local está incompleto. ' +
+            'Os dados foram preservados.'
           );
         }
 
-        if (meta.userId !== user.id) {
+        /*
+         * CORREÇÃO:
+         * Aceita cofres antigos sem userId.
+         * Não permite migrar automaticamente
+         * cofres pertencentes a outra conta.
+         */
+
+        if (
+          meta.userId &&
+          meta.userId !== user.id
+        ) {
           throw new Error(
-            'O cofre local pertence a outra conta ou não está vinculado.'
+            'O cofre local pertence a outra conta. ' +
+            'Não vou substituir seus dados.'
           );
         }
 
         await localUnlock(pass);
+
+        ensureSession(generation, user.id);
+
+        /*
+         * Vincula o cofre antigo à nova conta
+         * sem trocar sua senha, salt ou chave.
+         */
+
+        await persistLocalWithMeta(
+          {
+            ...meta,
+            userId: user.id
+          },
+          makeVaultData()
+        );
 
       } else {
         await createLocalVault(pass, user.id);
@@ -998,15 +1195,30 @@ async function initializeAccount(pass, user) {
       ensureSession(generation, user.id);
 
       await cloudSave();
+
+    } else {
+      /*
+       * A restauração pode mesclar registros locais
+       * que ainda não existem na nuvem.
+       * Envia a mesclagem após restaurar.
+       */
+
+      await cloudSave();
     }
 
     ensureSession(generation, user.id);
 
     $('pass').value = '';
 
-    setStatus('Conta conectada e dados sincronizados.');
+    setStatus(
+      'Conta conectada e dados sincronizados.'
+    );
 
     await openApp();
+
+    if (localRevision > syncedRevision) {
+      scheduleSync();
+    }
 
   } catch (error) {
     sessionGeneration++;
@@ -1015,12 +1227,16 @@ async function initializeAccount(pass, user) {
     key = null;
 
     try {
-      await supabase.auth.signOut({ scope: 'local' });
+      await supabase.auth.signOut({
+        scope: 'local'
+      });
     } catch (_) {}
 
     throw error;
   }
 }
+
+/* LOGIN */
 
 async function login() {
   const email = $('email').value.trim();
@@ -1031,15 +1247,18 @@ async function login() {
   }
 
   if (pass.length < 8) {
-    throw new Error('A senha precisa ter pelo menos 8 caracteres.');
+    throw new Error(
+      'A senha precisa ter pelo menos 8 caracteres.'
+    );
   }
 
   await ensureSupabase();
 
-  const { data, error } = await supabase.auth.signInWithPassword({
-    email,
-    password: pass
-  });
+  const { data, error } = await supabase.auth
+    .signInWithPassword({
+      email,
+      password: pass
+    });
 
   if (error) throw error;
 
@@ -1055,33 +1274,42 @@ async function signup() {
   }
 
   if (pass.length < 8) {
-    throw new Error('Use uma senha com pelo menos 8 caracteres.');
+    throw new Error(
+      'Use uma senha com pelo menos 8 caracteres.'
+    );
   }
 
   await ensureSupabase();
 
-  const { data, error } = await supabase.auth.signUp({
-    email,
-    password: pass
-  });
+  const { data, error } = await supabase.auth
+    .signUp({
+      email,
+      password: pass
+    });
 
   if (error) throw error;
 
   if (!data.session || !data.user) {
     showMessage(
-      'Cadastro iniciado. Confirme o e-mail recebido e depois entre no aplicativo.'
+      'Cadastro iniciado. Confirme o e-mail recebido ' +
+      'e depois entre no aplicativo.'
     );
+
     return;
   }
 
   await initializeAccount(pass, data.user);
 }
 
+/* ACESSO OFFLINE */
+
 async function offlineLogin() {
   const pass = $('pass').value;
 
   if (!pass) {
-    throw new Error('Digite sua senha de proteção.');
+    throw new Error(
+      'Digite sua senha de proteção.'
+    );
   }
 
   await localUnlock(pass);
@@ -1094,7 +1322,9 @@ async function offlineLogin() {
 
   if (supabase) {
     try {
-      await supabase.auth.signOut({ scope: 'local' });
+      await supabase.auth.signOut({
+        scope: 'local'
+      });
     } catch (_) {}
   }
 
@@ -1108,19 +1338,29 @@ async function offlineLogin() {
   await openApp();
 }
 
-/* Interface e navegação */
+/* INTERFACE E NAVEGAÇÃO */
 
 function showTab(tab) {
-  ['home', 'planning', 'expenses', 'add', 'settings'].forEach(name => {
-    $(name).classList.toggle('hidden', name !== tab);
-  });
-
-  document.querySelectorAll('[data-tab]').forEach(button => {
-    button.classList.toggle(
-      'active',
-      button.dataset.tab === tab
+  [
+    'home',
+    'planning',
+    'expenses',
+    'add',
+    'settings'
+  ].forEach(name => {
+    $(name).classList.toggle(
+      'hidden',
+      name !== tab
     );
   });
+
+  document.querySelectorAll('[data-tab]')
+    .forEach(button => {
+      button.classList.toggle(
+        'active',
+        button.dataset.tab === tab
+      );
+    });
 
   if (tab === 'planning') renderPlanning();
   if (tab === 'expenses') renderExpenses();
@@ -1160,15 +1400,30 @@ function recordHtml(item, actions = true) {
   const sign = item.type === 'in' ? '+' : '−';
 
   const toggleLabel = item.status === 'pending'
-    ? (item.type === 'in' ? 'Marcar recebido' : 'Marcar paga')
-    : (item.type === 'in' ? 'Voltar para a receber' : 'Voltar para pendente');
+    ? (
+      item.type === 'in'
+        ? 'Marcar recebido'
+        : 'Marcar paga'
+    )
+    : (
+      item.type === 'in'
+        ? 'Voltar para a receber'
+        : 'Voltar para pendente'
+    );
 
   return `
     <article class="record">
       <div class="record-main">
         <div class="record-title">${esc(item.desc)}</div>
-        <small>${item.date.split('-').reverse().join('/')} · ${esc(item.category)}</small>
-        <span class="status ${statusClass(item)}">${statusLabel(item)}</span>
+
+        <small>
+          ${item.date.split('-').reverse().join('/')}
+          · ${esc(item.category)}
+        </small>
+
+        <span class="status ${statusClass(item)}">
+          ${statusLabel(item)}
+        </span>
       </div>
 
       <div class="record-side">
@@ -1178,6 +1433,7 @@ function recordHtml(item, actions = true) {
 
         ${actions ? `
           <div class="record-actions">
+
             <button class="mini secondary"
               data-action="toggle"
               data-id="${esc(item.id)}">
@@ -1195,12 +1451,15 @@ function recordHtml(item, actions = true) {
               data-id="${esc(item.id)}">
               Excluir
             </button>
+
           </div>
         ` : ''}
       </div>
     </article>
   `;
 }
+
+/* PAINEL PRINCIPAL */
 
 function render() {
   const currentMonth = month();
@@ -1210,41 +1469,66 @@ function render() {
   );
 
   const income = monthly
-    .filter(item => item.type === 'in' && item.status === 'received')
+    .filter(
+      item =>
+        item.type === 'in' &&
+        item.status === 'received'
+    )
     .reduce((s, i) => s + i.value, 0);
 
   const expense = monthly
-    .filter(item => item.type === 'out' && item.status === 'paid')
+    .filter(
+      item =>
+        item.type === 'out' &&
+        item.status === 'paid'
+    )
     .reduce((s, i) => s + i.value, 0);
 
   const pendingIn = monthly
-    .filter(item => item.type === 'in' && item.status === 'pending')
+    .filter(
+      item =>
+        item.type === 'in' &&
+        item.status === 'pending'
+    )
     .reduce((s, i) => s + i.value, 0);
 
   const pendingOut = monthly
-    .filter(item => item.type === 'out' && item.status === 'pending')
+    .filter(
+      item =>
+        item.type === 'out' &&
+        item.status === 'pending'
+    )
     .reduce((s, i) => s + i.value, 0);
 
   const saved = income - expense;
   const target = income * goal / 100;
 
-  $('monthLabel').textContent = new Date().toLocaleDateString(
-    'pt-BR',
-    { month: 'long', year: 'numeric' }
-  );
+  $('monthLabel').textContent =
+    new Date().toLocaleDateString(
+      'pt-BR',
+      {
+        month: 'long',
+        year: 'numeric'
+      }
+    );
 
   $('balance').textContent = money(saved);
   $('income').textContent = money(income);
   $('expense').textContent = money(expense);
 
   $('pendingSummary').textContent =
-    `Pendente: ${money(pendingOut)} a pagar · ${money(pendingIn)} a receber`;
+    `Pendente: ${money(pendingOut)} a pagar · ` +
+    `${money(pendingIn)} a receber`;
 
   $('goalText').textContent =
-    `Meta de economia: ${goal}% da renda recebida (${money(target)}). Saldo realizado: ${money(saved)}.`;
+    `Meta de economia: ${goal}% da renda recebida ` +
+    `(${money(target)}). Saldo realizado: ${money(saved)}.`;
 
   $('goalProgress').value = target > 0
-    ? Math.max(0, Math.min(100, saved / target * 100))
+    ? Math.max(
+      0,
+      Math.min(100, saved / target * 100)
+    )
     : 0;
 
   $('goalPercent').value = goal;
@@ -1254,12 +1538,16 @@ function render() {
   );
 
   $('transactions').innerHTML = sorted.length
-    ? sorted.slice(0, 8).map(item => recordHtml(item, false)).join('')
+    ? sorted.slice(0, 8)
+      .map(item => recordHtml(item, false))
+      .join('')
     : '<p class="muted">Nenhum lançamento neste mês.</p>';
 
   renderPlanning();
   renderExpenses();
 }
+
+/* PLANEJAMENTO */
 
 function renderPlanning() {
   if (!$('planningList')) return;
@@ -1269,7 +1557,11 @@ function renderPlanning() {
   );
 
   const received = monthRecords
-    .filter(item => item.type === 'in' && item.status === 'received')
+    .filter(
+      item =>
+        item.type === 'in' &&
+        item.status === 'received'
+    )
     .reduce((s, i) => s + i.value, 0);
 
   const plannedIncome = Number(plan.income) > 0
@@ -1277,7 +1569,8 @@ function renderPlanning() {
     : received;
 
   const totalPercent = CATEGORIES.reduce(
-    (s, c) => s + Number(plan.percentages[c] || 0),
+    (s, c) =>
+      s + Number(plan.percentages[c] || 0),
     0
   );
 
@@ -1291,64 +1584,84 @@ function renderPlanning() {
     totalPercent > 100
   );
 
-  $('planningList').innerHTML = CATEGORIES.map(category => {
-    const percent = Number(plan.percentages[category] || 0);
-    const budget = plannedIncome * percent / 100;
+  $('planningList').innerHTML =
+    CATEGORIES.map(category => {
+      const percent = Number(
+        plan.percentages[category] || 0
+      );
 
-    const spent = monthRecords
-      .filter(
-        i => i.type === 'out' &&
-          i.category === category &&
-          i.status === 'paid'
-      )
-      .reduce((s, i) => s + i.value, 0);
+      const budget = plannedIncome * percent / 100;
 
-    const remaining = budget - spent;
+      const spent = monthRecords
+        .filter(
+          i =>
+            i.type === 'out' &&
+            i.category === category &&
+            i.status === 'paid'
+        )
+        .reduce((s, i) => s + i.value, 0);
 
-    return `
-      <div class="plan-row">
-        <div class="plan-head">
-          <strong>${esc(category)}</strong>
-          <span>${money(budget)}</span>
-        </div>
+      const remaining = budget - spent;
 
-        <div class="plan-inputs">
-          <label>Percentual
-            <input
-              type="number"
-              min="0"
-              max="100"
-              step="0.5"
-              data-plan-category="${esc(category)}"
-              value="${percent}">
-          </label>
+      return `
+        <div class="plan-row">
 
-          <div class="muted plan-detail">
-            Gasto realizado: ${money(spent)}<br>
-            Disponível:
-            <strong class="${remaining < 0 ? 'negative' : ''}">
-              ${money(remaining)}
-            </strong>
+          <div class="plan-head">
+            <strong>${esc(category)}</strong>
+            <span>${money(budget)}</span>
           </div>
-        </div>
 
-        <progress
-          max="100"
-          value="${budget > 0 ? Math.min(100, spent / budget * 100) : 0}">
-        </progress>
-      </div>
-    `;
-  }).join('');
+          <div class="plan-inputs">
+
+            <label>Percentual
+              <input
+                type="number"
+                min="0"
+                max="100"
+                step="0.5"
+                data-plan-category="${esc(category)}"
+                value="${percent}">
+            </label>
+
+            <div class="muted plan-detail">
+              Gasto realizado: ${money(spent)}<br>
+              Disponível:
+              <strong class="${remaining < 0 ? 'negative' : ''}">
+                ${money(remaining)}
+              </strong>
+            </div>
+
+          </div>
+
+          <progress
+            max="100"
+            value="${
+              budget > 0
+                ? Math.min(100, spent / budget * 100)
+                : 0
+            }">
+          </progress>
+
+        </div>
+      `;
+    }).join('');
 }
+
+/* PESQUISA MENSAL */
 
 function renderExpenses() {
   if (!$('expenseList')) return;
 
-  const selectedMonth = $('expenseMonth').value || month();
+  const selectedMonth =
+    $('expenseMonth').value || month();
 
   const list = records
-    .filter(item => item.date.slice(0, 7) === selectedMonth)
-    .sort((a, b) => b.date.localeCompare(a.date));
+    .filter(
+      item => item.date.slice(0, 7) === selectedMonth
+    )
+    .sort(
+      (a, b) => b.date.localeCompare(a.date)
+    );
 
   const query = $('expenseSearch')
     .value.trim()
@@ -1361,26 +1674,34 @@ function renderExpenses() {
   );
 
   const toPay = filtered
-    .filter(i => i.type === 'out' && i.status === 'pending')
+    .filter(
+      i => i.type === 'out' && i.status === 'pending'
+    )
     .reduce((s, i) => s + i.value, 0);
 
   const toReceive = filtered
-    .filter(i => i.type === 'in' && i.status === 'pending')
+    .filter(
+      i => i.type === 'in' && i.status === 'pending'
+    )
     .reduce((s, i) => s + i.value, 0);
 
   $('expenseTotals').textContent =
-    `A pagar: ${money(toPay)} · A receber: ${money(toReceive)}`;
+    `A pagar: ${money(toPay)} · ` +
+    `A receber: ${money(toReceive)}`;
 
   $('expenseList').innerHTML = filtered.length
     ? filtered.map(item => recordHtml(item, true)).join('')
     : '<p class="muted">Nenhuma conta encontrada neste mês.</p>';
 }
 
+/* FORMULÁRIO DE LANÇAMENTOS */
+
 function resetEntryForm() {
   editingRecordId = null;
 
   $('entryTitle').textContent = 'Novo lançamento';
   $('saveBtn').textContent = 'Salvar lançamento';
+
   $('desc').value = '';
   $('value').value = '';
   $('date').value = today();
@@ -1390,7 +1711,9 @@ function resetEntryForm() {
 }
 
 function editRecord(id) {
-  const item = records.find(record => record.id === id);
+  const item = records.find(
+    record => record.id === id
+  );
 
   if (!item) return;
 
@@ -1398,6 +1721,7 @@ function editRecord(id) {
 
   $('entryTitle').textContent = 'Editar lançamento';
   $('saveBtn').textContent = 'Salvar alterações';
+
   $('desc').value = item.desc;
   $('value').value = item.value;
   $('date').value = item.date;
@@ -1408,14 +1732,20 @@ function editRecord(id) {
   showTab('add');
 }
 
+/* EDIÇÃO, EXCLUSÃO E SITUAÇÃO */
+
 async function handleRecordAction(event) {
-  const button = event.target.closest('button[data-action]');
+  const button = event.target.closest(
+    'button[data-action]'
+  );
 
   if (!button) return;
 
   const id = button.dataset.id;
 
-  const item = records.find(record => record.id === id);
+  const item = records.find(
+    record => record.id === id
+  );
 
   if (!item) return;
 
@@ -1430,8 +1760,11 @@ async function handleRecordAction(event) {
     )) return;
 
     const oldRecords = records;
+    const oldDeletedIds = deletedIds;
 
-    records = records.filter(record => record.id !== id);
+    records = records.filter(
+      record => record.id !== id
+    );
 
     deletedIds = normalizeDeletedIds([
       ...deletedIds,
@@ -1445,9 +1778,11 @@ async function handleRecordAction(event) {
 
     } catch (error) {
       records = oldRecords;
-      deletedIds = deletedIds.filter(value => value !== id);
+      deletedIds = oldDeletedIds;
 
-      alert('Não foi possível excluir: ' + error.message);
+      alert(
+        'Não foi possível excluir: ' + error.message
+      );
     }
 
     return;
@@ -1455,9 +1790,14 @@ async function handleRecordAction(event) {
 
   if (button.dataset.action === 'toggle') {
     const oldStatus = item.status;
+    const oldUpdatedAt = item.updatedAt;
 
     item.status = item.status === 'pending'
-      ? (item.type === 'in' ? 'received' : 'paid')
+      ? (
+        item.type === 'in'
+          ? 'received'
+          : 'paid'
+      )
       : 'pending';
 
     item.updatedAt = Date.now();
@@ -1469,13 +1809,16 @@ async function handleRecordAction(event) {
 
     } catch (error) {
       item.status = oldStatus;
+      item.updatedAt = oldUpdatedAt;
 
-      alert('Não foi possível atualizar: ' + error.message);
+      alert(
+        'Não foi possível atualizar: ' + error.message
+      );
     }
   }
 }
 
-/* Eventos de acesso */
+/* BOTÕES DE ACESSO */
 
 $('loginBtn').onclick = async () => {
   try {
@@ -1498,7 +1841,7 @@ $('createBtn').onclick = async () => {
   } catch (error) {
     showMessage(
       'Não foi possível criar a conta: ' +
-      (error.message || 'erro desconhecido')
+      (error.message || 'erro desconhecido.')
     );
   }
 };
@@ -1510,12 +1853,13 @@ $('offlineBtn').onclick = async () => {
 
   } catch (error) {
     showMessage(
-      error.message || 'Não foi possível abrir os dados locais.'
+      error.message ||
+      'Não foi possível abrir os dados locais.'
     );
   }
 };
 
-/* Novo lançamento / edição */
+/* SALVAR LANÇAMENTO */
 
 $('saveBtn').onclick = async () => {
   const desc = $('desc').value.trim();
@@ -1525,7 +1869,9 @@ $('saveBtn').onclick = async () => {
   const status = $('recordStatus').value;
 
   if (!desc || desc.length > 300) {
-    return alert('Informe uma descrição válida, com até 300 caracteres.');
+    return alert(
+      'Informe uma descrição válida, com até 300 caracteres.'
+    );
   }
 
   if (!Number.isFinite(value) || value <= 0) {
@@ -1548,7 +1894,9 @@ $('saveBtn').onclick = async () => {
     (type === 'out' && status === 'received') ||
     (type === 'in' && status === 'paid')
   ) {
-    return alert('A situação não corresponde ao tipo do lançamento.');
+    return alert(
+      'A situação não corresponde ao tipo do lançamento.'
+    );
   }
 
   const oldRecords = records;
@@ -1569,12 +1917,16 @@ $('saveBtn').onclick = async () => {
   };
 
   records = existing
-    ? records.map(i => i.id === existing.id ? entry : i)
+    ? records.map(
+      i => i.id === existing.id ? entry : i
+    )
     : [...records, entry];
 
   try {
     await persistLocal();
+
     scheduleSync();
+
     resetEntryForm();
     showTab('expenses');
 
@@ -1592,12 +1944,14 @@ $('saveBtn').onclick = async () => {
   }
 };
 
-/* Planejamento */
+/* PLANEJAMENTO */
 
 $('planSave').onclick = async () => {
   const incomeRaw = $('planIncome').value;
 
-  const income = incomeRaw === '' ? 0 : Number(incomeRaw);
+  const income = incomeRaw === ''
+    ? 0
+    : Number(incomeRaw);
 
   if (!Number.isFinite(income) || income < 0) {
     return alert('Informe uma renda planejada válida.');
@@ -1618,7 +1972,9 @@ $('planSave').onclick = async () => {
       value < 0 ||
       value > 100
     ) {
-      return alert(`Percentual inválido em ${category}.`);
+      return alert(
+        `Percentual inválido em ${category}.`
+      );
     }
 
     percentages[category] = value;
@@ -1627,7 +1983,9 @@ $('planSave').onclick = async () => {
 
   if (total > 100.0001) {
     return alert(
-      `A soma das porcentagens é ${total.toLocaleString('pt-BR')}%. O total não pode ultrapassar 100%.`
+      `A soma das porcentagens é ` +
+      `${total.toLocaleString('pt-BR')}%. ` +
+      'O total não pode ultrapassar 100%.'
     );
   }
 
@@ -1641,6 +1999,7 @@ $('planSave').onclick = async () => {
 
   try {
     await persistLocal();
+
     scheduleSync();
     renderPlanning();
 
@@ -1657,12 +2016,19 @@ $('planSave').onclick = async () => {
   }
 };
 
+/* META DE ECONOMIA */
+
 $('goalSave').onclick = async () => {
   const raw = $('goalPercent').value;
   const value = Number(raw);
 
-  if (raw.trim() === '' || !validGoal(value)) {
-    return alert('Informe um percentual entre 0 e 100.');
+  if (
+    raw.trim() === '' ||
+    !validGoal(value)
+  ) {
+    return alert(
+      'Informe um percentual entre 0 e 100.'
+    );
   }
 
   const oldGoal = goal;
@@ -1673,6 +2039,7 @@ $('goalSave').onclick = async () => {
 
   try {
     await persistLocal();
+
     scheduleSync();
     render();
 
@@ -1681,16 +2048,26 @@ $('goalSave').onclick = async () => {
   } catch (error) {
     goal = oldGoal;
     goalUpdatedAt = oldUpdatedAt;
+
     $('goalPercent').value = goal;
 
-    alert('Não foi possível salvar a meta: ' + error.message);
+    alert(
+      'Não foi possível salvar a meta: ' + error.message
+    );
   }
 };
 
-/* Eventos da lista mensal */
+/* EVENTOS DA LISTA MENSAL */
 
-$('expenseMonth').addEventListener('change', renderExpenses);
-$('expenseSearch').addEventListener('input', renderExpenses);
+$('expenseMonth').addEventListener(
+  'change',
+  renderExpenses
+);
+
+$('expenseSearch').addEventListener(
+  'input',
+  renderExpenses
+);
 
 $('expenseList').addEventListener(
   'click',
@@ -1707,7 +2084,7 @@ $('cancelEditBtn').onclick = () => {
   showTab('expenses');
 };
 
-/* Backup criptografado */
+/* BACKUP CRIPTOGRAFADO */
 
 function download(data, name, type) {
   const link = document.createElement('a');
@@ -1720,7 +2097,10 @@ function download(data, name, type) {
   link.download = name;
   link.click();
 
-  setTimeout(() => URL.revokeObjectURL(url), 1500);
+  setTimeout(
+    () => URL.revokeObjectURL(url),
+    1500
+  );
 }
 
 $('exportBtn').onclick = async () => {
@@ -1760,8 +2140,13 @@ $('exportBtn').onclick = async () => {
       ...encrypted
     });
 
-    if (new Blob([backupText]).size > BACKUP_MAX_SIZE) {
-      throw new Error('O backup ultrapassa o limite de 10 MiB.');
+    if (
+      new Blob([backupText]).size >
+      BACKUP_MAX_SIZE
+    ) {
+      throw new Error(
+        'O backup ultrapassa o limite de 10 MiB.'
+      );
     }
 
     download(
@@ -1778,12 +2163,16 @@ $('exportBtn').onclick = async () => {
   }
 };
 
+/* RESTAURAÇÃO DO BACKUP */
+
 $('importBtn').onclick = async () => {
   const file = $('backupFile').files[0];
   const password = $('backupPass').value;
 
   if (!file || !password) {
-    return alert('Escolha o arquivo e informe a senha do backup.');
+    return alert(
+      'Escolha o arquivo e informe a senha do backup.'
+    );
   }
 
   if (file.size > BACKUP_MAX_SIZE) {
@@ -1791,7 +2180,8 @@ $('importBtn').onclick = async () => {
   }
 
   if (!confirm(
-    'A restauração substituirá os lançamentos e o planejamento atuais deste aparelho. Deseja continuar?'
+    'A restauração substituirá os lançamentos e o ' +
+    'planejamento atuais deste aparelho. Deseja continuar?'
   )) return;
 
   const oldState = {
@@ -1807,7 +2197,9 @@ $('importBtn').onclick = async () => {
   const oldBlob = await dbGet('data');
 
   try {
-    const backup = JSON.parse(await file.text());
+    const backup = JSON.parse(
+      await file.text()
+    );
 
     if (
       !backup ||
@@ -1823,13 +2215,18 @@ $('importBtn').onclick = async () => {
       new Uint8Array(backup.salt)
     );
 
-    const imported = await decrypt(backup, backupKey);
+    const imported = await decrypt(
+      backup,
+      backupKey
+    );
 
     const importedRecords = normalizeRecords(
       imported.records || []
     );
 
-    const importedGoal = Number(imported.goal ?? 15);
+    const importedGoal = Number(
+      imported.goal ?? 15
+    );
 
     if (!validGoal(importedGoal)) {
       throw new Error('Meta inválida no backup.');
@@ -1841,14 +2238,24 @@ $('importBtn').onclick = async () => {
       !oldBlob ||
       !Array.isArray(oldMeta.salt)
     ) {
-      throw new Error('Desbloqueie o cofre antes de restaurar.');
+      throw new Error(
+        'Desbloqueie o cofre antes de restaurar.'
+      );
     }
 
     const importedData = {
       records: importedRecords,
-      deletedIds: normalizeDeletedIds(imported.deletedIds || []),
+
+      deletedIds: normalizeDeletedIds(
+        imported.deletedIds || []
+      ),
+
       goal: importedGoal,
-      goalUpdatedAt: Number(imported.goalUpdatedAt || Date.now()),
+
+      goalUpdatedAt: Number(
+        imported.goalUpdatedAt || Date.now()
+      ),
+
       plan: normalizePlan(imported.plan)
     };
 
@@ -1862,6 +2269,13 @@ $('importBtn').onclick = async () => {
       );
     }
 
+    /*
+     * CORREÇÃO:
+     * O backup utiliza sua própria chave para validar
+     * os dados. Após a importação, os dados são
+     * recriptografados com a chave do cofre atual.
+     */
+
     applyVaultData(importedData);
 
     await persistLocalWithMeta(
@@ -1872,7 +2286,9 @@ $('importBtn').onclick = async () => {
     if (cloudEnabled && currentUser) {
       await cloudSave();
     } else {
-      setStatus('Backup restaurado neste aparelho.');
+      setStatus(
+        'Backup restaurado neste aparelho.'
+      );
     }
 
     $('backupFile').value = '';
@@ -1897,10 +2313,10 @@ $('importBtn').onclick = async () => {
           data: oldBlob
         });
       }
-
     } catch (_) {
       alert(
-        'Atenção: houve falha ao recuperar a cópia local anterior. Não feche o aplicativo.'
+        'Atenção: houve falha ao recuperar a cópia ' +
+        'local anterior. Não feche o aplicativo.'
       );
     }
 
@@ -1913,7 +2329,7 @@ $('importBtn').onclick = async () => {
   }
 };
 
-/* Sincronização manual */
+/* SINCRONIZAÇÃO MANUAL */
 
 $('syncBtn').onclick = () => {
   syncNow().catch(error => {
@@ -1924,7 +2340,7 @@ $('syncBtn').onclick = () => {
   });
 };
 
-/* Sair / bloquear */
+/* SAIR E BLOQUEAR */
 
 async function logout() {
   sessionGeneration++;
@@ -1934,62 +2350,82 @@ async function logout() {
 
   try {
     if (supabase) {
-      await supabase.auth.signOut({ scope: 'local' });
+      await supabase.auth.signOut({
+        scope: 'local'
+      });
     }
   } catch (_) {}
 
   key = null;
   records = [];
   deletedIds = [];
+
   goal = 15;
   goalUpdatedAt = 0;
+
   plan = normalizePlan();
+
   currentUser = null;
   cloudEnabled = false;
   editingRecordId = null;
 
   $('app').classList.add('hidden');
   $('lock').classList.remove('hidden');
+
   $('pass').value = '';
 
   setStatus(
-    'Aplicativo bloqueado. Seus dados locais permanecem criptografados.'
+    'Aplicativo bloqueado. Seus dados locais ' +
+    'permanecem criptografados.'
   );
 
-  showMessage('Sessão encerrada com segurança.');
+  showMessage(
+    'Sessão encerrada com segurança.'
+  );
 }
 
 $('logoutBtn').onclick = logout;
 $('homeLogoutBtn').onclick = logout;
 
-/* Reconexão e Service Worker */
+/* RECONEXÃO */
 
 window.addEventListener('online', () => {
   if (cloudEnabled && currentUser) {
     syncNow().catch(error => {
-      setStatus('Falha ao reconectar: ' + error.message);
+      setStatus(
+        'Falha ao reconectar: ' + error.message
+      );
     });
   }
 });
+
+/* SERVICE WORKER */
 
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => {
     navigator.serviceWorker.register(
       './sw.js',
-      { updateViaCache: 'none' }
+      {
+        updateViaCache: 'none'
+      }
     )
-    .then(registration => registration.update().catch(() => {}))
-    .catch(error => console.error('Service Worker:', error));
+    .then(registration =>
+      registration.update().catch(() => {})
+    )
+    .catch(error =>
+      console.error('Service Worker:', error)
+    );
   });
 }
 
-/* Inicialização */
+/* INICIALIZAÇÃO */
 
 (function boot() {
   try {
     if (!window.isSecureContext) {
       showMessage(
-        'O aplicativo precisa ser aberto em uma conexão segura HTTPS.'
+        'O aplicativo precisa ser aberto em uma ' +
+        'conexão segura HTTPS.'
       );
     }
 
@@ -2000,7 +2436,8 @@ if ('serviceWorker' in navigator) {
 
     if (!window.supabase) {
       console.info(
-        'Supabase será carregado somente quando o usuário solicitar acesso pela conta.'
+        'Supabase será carregado somente quando ' +
+        'o usuário solicitar acesso pela conta.'
       );
     }
 
@@ -2017,7 +2454,7 @@ if ('serviceWorker' in navigator) {
   }
 })();
 
-/* Tratamento de erros */
+/* TRATAMENTO DE ERROS */
 
 window.addEventListener('error', event => {
   console.error(
@@ -2030,26 +2467,30 @@ window.addEventListener('error', event => {
     !$('lock').classList.contains('hidden')
   ) {
     showMessage(
-      'O aplicativo encontrou um erro. Atualize a página e tente novamente.'
+      'O aplicativo encontrou um erro. ' +
+      'Atualize a página e tente novamente.'
     );
   }
 });
 
-window.addEventListener('unhandledrejection', event => {
-  console.error(
-    'Falha assíncrona:',
-    event.reason
-  );
+window.addEventListener(
+  'unhandledrejection',
+  event => {
+    console.error(
+      'Falha assíncrona:',
+      event.reason
+    );
 
-  if (
-    $('lock') &&
-    !$('lock').classList.contains('hidden')
-  ) {
-    const reason =
-      event.reason && event.reason.message
-        ? event.reason.message
-        : 'Falha inesperada.';
+    if (
+      $('lock') &&
+      !$('lock').classList.contains('hidden')
+    ) {
+      const reason =
+        event.reason && event.reason.message
+          ? event.reason.message
+          : 'Falha inesperada.';
 
-    showMessage(reason);
+      showMessage(reason);
+    }
   }
-});
+);
