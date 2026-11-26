@@ -17,7 +17,8 @@
     *{box-sizing:border-box}
     body{margin:0;background:var(--bg);color:var(--text);font:16px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;padding:env(safe-area-inset-top) 16px calc(24px + env(safe-area-inset-bottom))}
     header{padding:22px 4px 14px}
-    h1{font-size:25px;margin:0 0 5px}h2{font-size:17px;margin:0 0 14px}
+    h1{font-size:25px;margin:0 0 5px}
+    h2{font-size:17px;margin:0 0 14px}
     .muted{color:var(--muted);font-size:13px}
     .card{background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:17px;margin:12px 0}
     .balance{font-size:32px;font-weight:750;margin:7px 0}
@@ -40,12 +41,15 @@
     footer{text-align:center;color:var(--muted);font-size:11px;padding:22px}
     #lockMsg{overflow-wrap:anywhere}
     progress{width:100%;height:9px;accent-color:var(--green);margin-top:8px}
-    .amount.in{color:var(--green)}.amount.out{color:var(--red)}
+    .amount.in{color:var(--green)}
+    .amount.out{color:var(--red)}
     .record{display:flex;justify-content:space-between;gap:12px;padding:13px 0;border-bottom:1px solid var(--line)}
     .record:last-child{border:0}
-    .record-main{min-width:0;flex:1}.record-title{font-weight:650;overflow-wrap:anywhere}
+    .record-main{min-width:0;flex:1}
+    .record-title{font-weight:650;overflow-wrap:anywhere}
     .record small{display:block;color:var(--muted);margin-top:4px}
-    .record-side{text-align:right;min-width:125px}.record-side strong{white-space:nowrap}
+    .record-side{text-align:right;min-width:125px}
+    .record-side strong{white-space:nowrap}
     .record-actions{display:grid;grid-template-columns:1fr 1fr;gap:5px;margin-top:8px}
     .mini{font-size:11px;min-height:32px;padding:6px 7px;border-radius:8px}
     .mini:first-child{grid-column:span 2}
@@ -53,30 +57,44 @@
     .status.completed{background:#183d2b;color:var(--green)}
     .status.pending{background:#3a3020;color:var(--yellow)}
     .plan-row{padding:13px 0;border-bottom:1px solid var(--line)}
-    .plan-row:last-child{border:0}.plan-head{display:flex;justify-content:space-between;gap:10px}
+    .plan-row:last-child{border:0}
+    .plan-head{display:flex;justify-content:space-between;gap:10px}
     .plan-inputs{display:grid;grid-template-columns:110px 1fr;gap:12px;align-items:end}
-    .plan-inputs label{margin-bottom:0}.plan-detail{padding-bottom:9px;line-height:1.6}
+    .plan-inputs label{margin-bottom:0}
+    .plan-detail{padding-bottom:9px;line-height:1.6}
     .warning-text,.negative{color:var(--red)!important}
     .toolbar{display:grid;grid-template-columns:1fr 1fr;gap:10px}
     .top-actions{display:flex;justify-content:flex-end;margin-top:12px}
     .top-actions button{width:auto;min-width:105px;padding:9px 14px}
     .section-note{margin:4px 0 12px;line-height:1.5}
-    @media(max-width:380px){nav{gap:4px}nav button{font-size:10px;padding:8px 2px}.balance{font-size:27px}.record{gap:6px}.record-side{min-width:112px}.mini{font-size:10px}}
+    @media(max-width:380px){
+      nav{gap:4px}
+      nav button{font-size:10px;padding:8px 2px}
+      .balance{font-size:27px}
+      .record{gap:6px}
+      .record-side{min-width:112px}
+      .mini{font-size:10px}
+    }
   </style>
 </head>
 <body>
+
   <section id="lock" class="card">
     <div class="center">
       <h1>Meu Controle Financeiro</h1>
       <p class="muted">Crie seu acesso local ou entre na sua conta. Seus dados ficam criptografados neste aparelho.</p>
     </div>
+
     <label for="email">E-mail da conta</label>
     <input id="email" type="email" autocomplete="username" placeholder="seuemail@exemplo.com">
+
     <label for="pass">Senha</label>
     <input id="pass" type="password" autocomplete="current-password" placeholder="Mínimo de 8 caracteres">
+
     <button id="loginBtn" style="margin-top:14px">Entrar na minha conta</button>
     <button id="createBtn" class="secondary" style="margin-top:9px">Criar conta</button>
     <button id="offlineBtn" class="secondary" style="margin-top:9px">Criar ou entrar somente neste aparelho</button>
+
     <p id="lockMsg" class="muted" role="status" aria-live="polite"></p>
   </section>
 
@@ -86,7 +104,9 @@
       <div class="muted" id="monthLabel"></div>
       <div class="muted" id="cloudLabel"></div>
       <div class="muted" id="syncStatus" role="status" aria-live="polite">Aguardando acesso.</div>
-      <div class="top-actions"><button id="homeLogoutBtn" class="danger">Sair da conta</button></div>
+      <div class="top-actions">
+        <button id="homeLogoutBtn" class="danger">Sair da conta</button>
+      </div>
     </header>
 
     <nav aria-label="Navegação principal">
@@ -102,16 +122,24 @@
         <div class="muted">Saldo realizado do mês</div>
         <div class="balance" id="balance">R$ 0,00</div>
         <div class="stats">
-          <div class="stat"><span class="muted">Recebido</span><strong id="income" class="amount in">R$ 0,00</strong></div>
-          <div class="stat"><span class="muted">Pago</span><strong id="expense" class="amount out">R$ 0,00</strong></div>
+          <div class="stat">
+            <span class="muted">Recebido</span>
+            <strong id="income" class="amount in">R$ 0,00</strong>
+          </div>
+          <div class="stat">
+            <span class="muted">Pago</span>
+            <strong id="expense" class="amount out">R$ 0,00</strong>
+          </div>
         </div>
         <p id="pendingSummary" class="muted"></p>
       </div>
+
       <div class="card">
         <h2>Meta de economia</h2>
         <div id="goalText" class="muted"></div>
         <progress id="goalProgress" max="100" value="0"></progress>
       </div>
+
       <div class="card">
         <h2>Últimos lançamentos do mês</h2>
         <div id="transactions"></div>
@@ -123,12 +151,15 @@
       <div class="card">
         <h2>Planejamento financeiro</h2>
         <p class="muted section-note">Informe sua renda de referência e distribua até 100% entre as categorias. Os valores são calculados automaticamente.</p>
+
         <label for="planIncome">Renda mensal planejada (R$)</label>
         <input id="planIncome" type="number" min="0" step="0.01" inputmode="decimal" placeholder="Ex.: 5000,00">
+
         <p id="planPercentTotal" class="muted">Total distribuído: 0%</p>
         <div id="planningList"></div>
         <button id="planSave" style="margin-top:14px">Salvar planejamento</button>
       </div>
+
       <div class="card">
         <h2>Meta de economia</h2>
         <label for="goalPercent">Percentual da renda recebida que deseja economizar</label>
@@ -141,10 +172,13 @@
     <section id="expenses" class="hidden">
       <div class="card">
         <h2>Gastos, contas e recebimentos</h2>
+
         <label for="expenseMonth">Pesquisar por mês</label>
         <input id="expenseMonth" type="month">
+
         <label for="expenseSearch">Pesquisar descrição ou categoria</label>
         <input id="expenseSearch" type="search" placeholder="Digite para filtrar...">
+
         <p id="expenseTotals" class="muted"></p>
         <div id="expenseList"></div>
       </div>
@@ -153,20 +187,53 @@
     <section id="add" class="hidden">
       <div class="card">
         <h2 id="entryTitle">Novo lançamento</h2>
+
         <label for="desc">Descrição</label>
         <input id="desc" maxlength="300" placeholder="Ex.: aluguel, salário, supermercado">
+
         <div class="formgrid">
-          <div><label for="value">Valor (R$)</label><input id="value" type="number" min="0.01" step="0.01" inputmode="decimal" placeholder="0,00"></div>
-          <div><label for="type">Tipo</label><select id="type"><option value="out">Despesa</option><option value="in">Receita</option></select></div>
+          <div>
+            <label for="value">Valor (R$)</label>
+            <input id="value" type="number" min="0.01" step="0.01" inputmode="decimal" placeholder="0,00">
+          </div>
+          <div>
+            <label for="type">Tipo</label>
+            <select id="type">
+              <option value="out">Despesa</option>
+              <option value="in">Receita</option>
+            </select>
+          </div>
         </div>
+
         <div class="formgrid">
-          <div><label for="category">Categoria</label><select id="category">
-            <option>Moradia</option><option>Alimentação</option><option>Transporte</option><option>Saúde</option><option>Educação</option><option>Lazer</option><option>Contas</option><option>Salário</option><option>Investimentos</option><option>Outros</option>
-          </select></div>
-          <div><label for="date">Data</label><input id="date" type="date"></div>
+          <div>
+            <label for="category">Categoria</label>
+            <select id="category">
+              <option>Moradia</option>
+              <option>Alimentação</option>
+              <option>Transporte</option>
+              <option>Saúde</option>
+              <option>Educação</option>
+              <option>Lazer</option>
+              <option>Contas</option>
+              <option>Salário</option>
+              <option>Investimentos</option>
+              <option>Outros</option>
+            </select>
+          </div>
+          <div>
+            <label for="date">Data</label>
+            <input id="date" type="date">
+          </div>
         </div>
+
         <label for="recordStatus">Situação</label>
-        <select id="recordStatus"><option value="pending">Pendente</option><option value="paid">Pago</option><option value="received">Recebido</option></select>
+        <select id="recordStatus">
+          <option value="pending">Pendente</option>
+          <option value="paid">Pago</option>
+          <option value="received">Recebido</option>
+        </select>
+
         <button id="saveBtn" style="margin-top:14px">Salvar lançamento</button>
         <button id="cancelEditBtn" class="secondary" style="margin-top:8px">Cancelar edição / limpar</button>
       </div>
@@ -178,25 +245,37 @@
         <p class="muted" id="syncInfo">A sincronização depende de conexão com a internet.</p>
         <button id="syncBtn">Sincronizar agora</button>
       </div>
+
       <div class="card">
         <h2>Segurança e backup</h2>
         <p class="muted">O backup é exportado criptografado. A senha usada para exportar deve ser a mesma senha que protege o cofre. Guarde o arquivo em local seguro.</p>
+
         <button id="exportBtn">Exportar backup criptografado</button>
+
         <label for="backupFile">Restaurar backup</label>
         <input id="backupFile" type="file" accept=".json,application/json">
+
         <label for="backupPass">Senha do backup</label>
         <input id="backupPass" type="password" autocomplete="off">
+
         <button id="importBtn" class="secondary" style="margin-top:10px">Restaurar backup</button>
       </div>
+
       <div class="card">
         <h2>Sessão</h2>
         <button class="danger" id="logoutBtn">Sair e bloquear aplicativo</button>
         <p class="muted">Sair bloqueia o acesso, mas não apaga seus dados locais criptografados. Não apague os dados do navegador sem antes exportar um backup.</p>
       </div>
     </section>
+
     <footer>Meu Controle Financeiro · Uso pessoal · Dados locais criptografados</footer>
   </main>
 
-  <script src="./app.js?v=11.1"></script>
+  <!-- Biblioteca oficial Supabase JavaScript v2 -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+
+  <!-- Aplicativo -->
+  <script src="./app.js?v=11.2"></script>
+
 </body>
 </html>
